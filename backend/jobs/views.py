@@ -1,1021 +1,1703 @@
-from rest_framework import viewsets, status
+import logging
+import re
+import time
+from datetime import timedelta
+from decimal import Decimal
+from typing import Dict, List, Optional, Tuple
+
+from django.http import JsonResponse
+from django.utils import timezone
+from django.utils.decorators import method_decorator
+from django.views.decorators.csrf import csrf_exempt
+from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from django.db.models import Q
-from bs4 import BeautifulSoup
-import requests
-import logging
-import uuid
-import shutil
 from selenium import webdriver
-from selenium.webdriver.firefox.options import Options
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
-import time
+from bs4 import BeautifulSoup
 
 from .models import Job
 from .serializers import JobSerializer
 
+# Setup logging
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class JobViewSet(viewsets.ModelViewSet):
-    queryset = Job.objects.all().order_by('-created_at')
-    serializer_class = JobSerializer
 
-    def get_queryset(self):
-        queryset = super().get_queryset()
+class DevSuniteScraperService:
+    """
+    Professional DevSunite scraper service integrated into Django backend
+    """
+    
+    def __init__(self):
+        self.driver = None
+        self.wait = None
+        self.base_url = "https://devsunite.com"
+        self.jobs_url = f"{self.base_url}/jobs"
         
-        # Filter by job type
-        job_type = self.request.query_params.get('job_type', None)
-        if job_type:
-            queryset = queryset.filter(job_type__in=job_type.split(','))
-        
-        # Filter by location
-        location = self.request.query_params.get('location', None)
-        if location:
-            queryset = queryset.filter(location__icontains=location)
-        
-        # Filter by experience
-        experience = self.request.query_params.get('experience', None)
-        if experience:
-            queryset = queryset.filter(experience_required__icontains=experience)
-        
-        # Search by role or company
-        search = self.request.query_params.get('search', None)
-        if search:
-            queryset = queryset.filter(
-                Q(role__icontains=search) | 
-                Q(company_name__icontains=search)
-            )
-        
-        return queryset
-
-    @action(detail=False, methods=['post'], url_path='refresh')
-    def refresh(self, request):
-        """Endpoint to trigger job scraping from devsunite.com using Selenium"""
-        driver = None
-        
+    def setup_driver(self):
+        """Initialize Chrome WebDriver with optimized settings"""
         try:
-            # Setup Chrome options for headless browsing in codespace environment
-            from selenium.webdriver.chrome.options import Options
             chrome_options = Options()
-            chrome_options.add_argument("--headless")
-            chrome_options.add_argument("--no-sandbox")
-            chrome_options.add_argument("--disable-dev-shm-usage")
+            # Headless and optimized for codespace
+            chrome_options.add_argument('--headless')
+            chrome_options.add_argument('--no-sandbox')
+            chrome_options.add_argument('--disable-dev-shm-usage')
+            chrome_options.add_argument('--disable-gpu')
+            chrome_options.add_argument('--window-size=1920,1080')
             
-            # Set the binary location to our installed Chrome
-            chrome_options.binary_location = "/usr/bin/google-chrome-stable"
+            # Anti-detection measures
+            chrome_options.add_argument('--disable-blink-features=AutomationControlled')
+            chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            chrome_options.add_experimental_option('useAutomationExtension', False)
             
-            # Create a unique user data directory
-            import os
-            import tempfile
-            temp_dir = tempfile.mkdtemp()
-            chrome_options.add_argument(f"--user-data-dir={temp_dir}")
+            # Performance optimizations
+            chrome_options.add_argument('--disable-extensions')
+            chrome_options.add_argument('--disable-plugins')
+            chrome_options.add_argument('--disable-images')
             
-            # Initialize the driver with Chrome
-            driver = webdriver.Chrome(options=chrome_options)
+            service = Service(ChromeDriverManager().install())
+            self.driver = webdriver.Chrome(service=service, options=chrome_options)
             
-            base_url = 'https://devsunite.com/jobs'
-            jobs_scraped_count = 0
-            max_pages = 5  # Limit for testing
+            # Remove webdriver property
+            self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
             
-            # Since pagination doesn't change URL, we'll handle it with Selenium
-            logger.info(f"Starting to scrape devsunite.com/jobs")
-            driver.get(base_url)
-            
-            # Wait for the page to load and jobs to appear
-            try:
-                WebDriverWait(driver, 15).until(
-                    EC.presence_of_element_located((By.TAG_NAME, "main"))
-                )
-                time.sleep(3)  # Wait for dynamic content to load
-                logger.info("Page loaded successfully")
-            except TimeoutException:
-                logger.warning("Timeout waiting for page to load")
-                return Response({'status': 'error', 'message': 'Page load timeout'})
-            
-            # Process multiple pages using pagination
-            current_page = 1
-            while current_page <= max_pages:
-                logger.info(f"Processing page {current_page}")
-                
-                # Get page source and parse with BeautifulSoup
-                soup = BeautifulSoup(driver.page_source, 'html.parser')
-                
-                # Find job cards based on devsunite structure
-                job_cards = self._find_job_cards(soup)
-                
-                if not job_cards:
-                    logger.info(f"No job cards found on page {current_page}. Ending scrape.")
-                    break
-                
-                logger.info(f"Found {len(job_cards)} job cards on page {current_page}")
-                
-                # Process each job card
-                for i, card in enumerate(job_cards):
-                    try:
-                        logger.info(f"Processing job card {i+1}/{len(job_cards)}")
-                        job_data = self._extract_job_from_card(card, driver)
-                        
-                        if job_data and job_data.get('role') and job_data.get('company_name'):
-                            job, created = Job.objects.update_or_create(
-                                company_name=job_data['company_name'],
-                                role=job_data['role'],
-                                defaults=job_data
-                            )
-                            if created:
-                                jobs_scraped_count += 1
-                                logger.info(f"Created job: {job_data['role']} at {job_data['company_name']}")
-                            else:
-                                logger.info(f"Updated job: {job_data['role']} at {job_data['company_name']}")
-                        
-                    except Exception as e:
-                        logger.error(f"Error processing job card {i+1}: {e}")
-                        continue
-                
-                # Try to navigate to next page
-                if not self._go_to_next_page(driver, current_page):
-                    logger.info("No more pages to process")
-                    break
-                    
-                current_page += 1
-                time.sleep(2)  # Wait between pages
-            
-            return Response({'status': 'success', 'jobs_scraped': jobs_scraped_count})
+            self.wait = WebDriverWait(self.driver, 10)
+            logger.info("✅ Chrome WebDriver initialized successfully")
+            return True
             
         except Exception as e:
-            logger.error(f"An unexpected error occurred during scraping: {e}")
-            return Response(
-                {'status': 'error', 'message': str(e)},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
-        finally:
-            if driver:
-                try:
-                    driver.quit()
-                except Exception as e:
-                    logger.debug(f"Error closing driver: {e}")
-
-    def _find_job_cards(self, soup):
-        """Find job cards in the devsunite.com page based on actual structure"""
-        job_cards = []
-        
-        # Based on the provided HTML structure, the job cards have these patterns:
-        selectors_to_try = [
-            # Primary selector based on the actual structure
-            'div.group.relative.w-full',  # Main card container
-            'div[class*="group"][class*="relative"][class*="w-full"]',  # More flexible version
-            'div[class*="rounded-lg"][class*="text-card-foreground"]:has(a[href*="/jobs/"])',  # Inner card with job links
-            'div[class*="border"][class*="border-neutral-800"][class*="bg-black"]',  # Specific styling classes
-            # Fallback selectors
-            'div:has(a[href*="/jobs/"]):has(span:contains("View Details"))',  # Has job link and view details
-            'div:has(span:contains("Apply Now")):has(span:contains("View Details"))',  # Has both buttons
-            'div[class*="shadow"]:has(img[alt]):has(a[href^="/jobs/"])',  # Has company logo and job link
-        ]
-        
-        for selector in selectors_to_try:
-            try:
-                job_cards = soup.select(selector)
-                if job_cards and len(job_cards) > 0:
-                    # Filter out cards that are actually job listings
-                    filtered_cards = []
-                    for card in job_cards:
-                        # Check if card has the essential elements of a job listing
-                        has_company = card.find('img', alt=True) or card.find(text=lambda text: text and any(word in text.upper() for word in ['COMPANY', 'CORP', 'INC', 'LTD', 'TECH', 'SOLUTIONS']))
-                        has_role = card.find(text=lambda text: text and any(word in text.lower() for word in ['engineer', 'developer', 'designer', 'manager', 'analyst', 'specialist']))
-                        has_buttons = card.find('a', string=lambda text: text and 'view details' in text.lower()) and card.find('a', string=lambda text: text and 'apply' in text.lower())
-                        
-                        if has_company or has_role or has_buttons:
-                            filtered_cards.append(card)
-                    
-                    if filtered_cards:
-                        logger.info(f"Found {len(filtered_cards)} job cards using selector: {selector}")
-                        return filtered_cards
-            except Exception as e:
-                logger.debug(f"Error with selector {selector}: {e}")
-                continue
-        
-        logger.warning("No job cards found with any selector")
-        return []
-
-    def _go_to_next_page(self, driver, current_page):
-        """Handle pagination on devsunite.com"""
-        try:
-            # Look for next page button or pagination controls
-            next_selectors = [
-                'button[aria-label*="next"]',
-                'button:contains("Next")',
-                'a[aria-label*="next"]',
-                'a:contains("Next")',
-                '[class*="next"]:not([disabled])',
-                '[class*="pagination"] button:last-child:not([disabled])',
-                f'button[aria-label="Go to page {current_page + 1}"]',
-                f'a[aria-label="Go to page {current_page + 1}"]'
-            ]
-            
-            for selector in next_selectors:
-                try:
-                    # Use JavaScript to find and click next button
-                    script = f"""
-                    var elements = document.querySelectorAll('{selector}');
-                    for (var i = 0; i < elements.length; i++) {{
-                        var elem = elements[i];
-                        if (elem.textContent.toLowerCase().includes('next') || 
-                            elem.getAttribute('aria-label') && elem.getAttribute('aria-label').toLowerCase().includes('next')) {{
-                            elem.click();
-                            return true;
-                        }}
-                    }}
-                    return false;
-                    """
-                    
-                    result = driver.execute_script(script)
-                    if result:
-                        logger.info(f"Clicked next page button using selector: {selector}")
-                        time.sleep(3)  # Wait for page to load
-                        return True
-                        
-                except Exception as e:
-                    logger.debug(f"Error with next selector {selector}: {e}")
-                    continue
-            
-            # Try to find pagination by page numbers
-            try:
-                next_page_script = f"""
-                var pageButtons = document.querySelectorAll('[class*="pagination"] button, [class*="pagination"] a');
-                for (var i = 0; i < pageButtons.length; i++) {{
-                    var btn = pageButtons[i];
-                    if (btn.textContent.trim() === '{current_page + 1}') {{
-                        btn.click();
-                        return true;
-                    }}
-                }}
-                return false;
-                """
-                
-                result = driver.execute_script(next_page_script)
-                if result:
-                    logger.info(f"Navigated to page {current_page + 1} by clicking page number")
-                    time.sleep(3)
-                    return True
-                    
-            except Exception as e:
-                logger.debug(f"Error with page number navigation: {e}")
-            
-            return False
-            
-        except Exception as e:
-            logger.error(f"Error navigating to next page: {e}")
+            logger.error(f"❌ Failed to initialize WebDriver: {e}")
             return False
     
-    def _extract_job_from_card(self, card, driver):
-        """Extract job information from a devsunite.com job card element"""
+    def close_driver(self):
+        """Safely close WebDriver"""
+        if self.driver:
+            try:
+                self.driver.quit()
+                logger.info("🔒 WebDriver closed successfully")
+            except Exception as e:
+                logger.error(f"⚠️ Error closing WebDriver: {e}")
+    
+    def extract_job_cards(self, max_pages: int = 5) -> List[Dict]:
+        """Extract job information from multiple pages using proven working logic"""
         try:
-            # Initialize job data with defaults
-            job_data = {
-                'job_type': 'FULL_TIME',  # Default
-                'location': 'Remote',  # Default
-                'experience_required': 'Not specified',  # Default
-                'skills_required': [],
-                'short_description': '',
-                'full_description': '',
-                'apply_link': '',
-                'compensation': '',
-                'details_scraped': False  # Flag to track if we've scraped the details page
-            }
+            logger.info(f"🔍 Loading DevSunite jobs page: {self.jobs_url}")
+            self.driver.get(self.jobs_url)
             
-            # Extract job title/role
-            role = self._extract_job_title(card)
-            if not role:
-                logger.debug("No job title found in card")
-                return None
+            # Wait for React to render
+            time.sleep(5)
             
-            job_data['role'] = role
-            logger.info(f"Found job: {role}")
+            all_jobs = []
+            page_num = 1
+            previous_job_count = 0
+            no_change_count = 0
             
-            # Extract company name
-            company_name = self._extract_company_name(card, role)
-            if not company_name:
-                logger.debug("No company name found in card")
-                return None
-            
-            job_data['company_name'] = company_name
-            logger.info(f"Company: {company_name}")
-            
-            # Extract job type (Full-time, Part-time, Internship, etc.)
-            job_type = self._extract_job_type(card)
-            if job_type:
-                job_data['job_type'] = job_type
-                logger.debug(f"Job type: {job_type}")
-            
-            # Extract location
-            location = self._extract_location(card)
-            if location:
-                job_data['location'] = location
-                logger.debug(f"Location: {location}")
-            
-            # Extract experience level
-            experience = self._extract_experience(card)
-            if experience:
-                job_data['experience_required'] = experience
-                logger.debug(f"Experience: {experience}")
-            
-            # Extract description
-            description = self._extract_description(card)
-            if description:
-                job_data['short_description'] = description
-                job_data['full_description'] = description
-                logger.debug(f"Short description: {description[:50]}...")
-            
-            # Extract compensation
-            compensation = self._extract_compensation(card)
-            if compensation:
-                job_data['compensation'] = compensation
-                logger.debug(f"Compensation: {compensation}")
-            
-            # Extract skills
-            skills = self._extract_skills(card)
-            if skills:
-                job_data['skills_required'] = skills
-                logger.debug(f"Skills from card: {', '.join(skills[:5])}")
-            
-            # Extract apply link and view details link
-            apply_link, view_details_link = self._extract_links(card)
-            if apply_link:
-                job_data['apply_link'] = apply_link
-                logger.debug(f"Apply link: {apply_link}")
-            
-            # Always try to get additional info from the details page if we have a link
-            # This ensures we get the full job description and skills
-            if view_details_link:
-                # Store the view details link even if we have an apply link
-                job_data['view_details_link'] = view_details_link
-                logger.info(f"View details link: {view_details_link}")
+            while page_num <= max_pages:
+                logger.info(f"📄 Scraping page {page_num} of {max_pages}")
                 
-                if not apply_link:  # If no apply link, use view details as apply link
-                    job_data['apply_link'] = view_details_link
+                # Get current page source and parse
+                soup = BeautifulSoup(self.driver.page_source, 'html.parser')
                 
-                # Get complete job details from the job's dedicated page
-                try:
-                    logger.info(f"Getting additional data from: {view_details_link}")
-                    additional_data = self._get_full_description_selenium(view_details_link, driver)
-                    if additional_data:
-                        # Log what we found from the job details page
-                        data_keys = list(additional_data.keys())
-                        logger.info(f"Found additional data fields: {', '.join(data_keys)}")
-                        
-                        # Check for critical fields we want from the details page
-                        if 'full_description' in additional_data:
-                            desc_length = len(additional_data['full_description'])
-                            logger.info(f"Retrieved full job description ({desc_length} chars)")
+                # Find job cards - PROVEN WORKING SELECTORS
+                job_cards = soup.find_all('div', class_=lambda x: x and 'rounded-lg' in x and 'border-neutral-800' in x and 'bg-black' in x)
+                
+                if not job_cards:
+                    logger.info(f"🛑 No job cards found on page {page_num}, stopping pagination")
+                    break
+                
+                logger.info(f"📋 Found {len(job_cards)} job cards on page {page_num}")
+                
+                # Check if job count hasn't increased (for infinite scroll detection)
+                if len(job_cards) == previous_job_count:
+                    no_change_count += 1
+                    if no_change_count >= 2:
+                        logger.info(f"🛑 Job count unchanged for {no_change_count} attempts, stopping pagination")
+                        break
+                else:
+                    no_change_count = 0
+                
+                previous_job_count = len(job_cards)
+                
+                # Extract jobs from current page (only new ones for infinite scroll)
+                start_index = len(all_jobs) if page_num > 1 else 0
+                page_jobs = []
+                
+                for i, card in enumerate(job_cards[start_index:], start_index + 1):
+                    try:
+                        job_info = self.parse_job_card(card)
+                        if job_info:
+                            # Check for duplicates
+                            is_duplicate = any(
+                                existing_job['title'] == job_info['title'] and 
+                                existing_job['company'] == job_info['company']
+                                for existing_job in all_jobs
+                            )
                             
-                        if 'skills_required' in additional_data:
-                            skills = additional_data['skills_required']
-                            logger.info(f"Retrieved {len(skills)} skills: {', '.join(skills[:5])}...")
+                            if not is_duplicate:
+                                logger.info(f"✅ Page {page_num} - Job {i}: {job_info['title']} at {job_info['company']}")
+                                page_jobs.append(job_info)
+                            else:
+                                logger.info(f"⚠️  Skipping duplicate: {job_info['title']} at {job_info['company']}")
                         
-                        # Preserve existing data if additional data doesn't provide it
-                        for key, value in additional_data.items():
-                            if value:  # Only update if the additional data has a non-empty value
-                                # For skills, merge lists if both exist
-                                if key == 'skills_required' and job_data.get('skills_required'):
-                                    combined_skills = list(set(job_data['skills_required'] + value))
-                                    job_data[key] = combined_skills
-                                    logger.debug(f"Combined skills: {len(combined_skills)} total")
-                                else:
-                                    job_data[key] = value
-                        
-                        job_data['details_scraped'] = True
-                        logger.info(f"Successfully updated job data with fields from details page")
-                except Exception as e:
-                    logger.error(f"Error getting additional data from view details page: {e}")
-                    import traceback
-                    logger.error(traceback.format_exc())
-            else:
-                logger.warning(f"No view details link found for job: {job_data['role']} at {job_data['company_name']}")
+                    except Exception as e:
+                        logger.error(f"❌ Error parsing job card {i} on page {page_num}: {e}")
+                        continue
+                
+                all_jobs.extend(page_jobs)
+                logger.info(f"📊 Page {page_num} added {len(page_jobs)} new jobs (Total: {len(all_jobs)})")
+                
+                # If no new jobs were added, we might have reached the end
+                if len(page_jobs) == 0:
+                    logger.info(f"🏁 No new jobs found on page {page_num}, stopping pagination")
+                    break
+                
+                # Try to navigate to next page
+                if page_num < max_pages:
+                    logger.info(f"🔄 Attempting to navigate to page {page_num + 1}")
+                    if self.navigate_to_next_page():
+                        page_num += 1
+                        time.sleep(3)  # Wait for new page to load
+                        logger.info(f"✅ Successfully navigated to page {page_num}")
+                    else:
+                        logger.info(f"🏁 No more pages available after page {page_num}")
+                        break
+                else:
+                    logger.info(f"🏁 Reached maximum pages limit ({max_pages})")
+                    break
             
-            # Include the external_id as a unique identifier for this job
-            external_id = str(uuid.uuid4())
-            job_data['external_id'] = external_id
+            logger.info(f"🎯 Total unique jobs extracted from {page_num} pages: {len(all_jobs)}")
             
-            # Log success with detailed info
-            if job_data.get('details_scraped', False):
-                logger.info(f"✅ Scraped job with full details: {job_data['role']} at {job_data['company_name']}")
-                desc_length = len(job_data.get('full_description', ''))
-                skills_count = len(job_data.get('skills_required', []))
-                logger.info(f"   - Description: {desc_length} chars, Skills: {skills_count}")
-            else:
-                logger.info(f"⚠️ Scraped job with basic info only: {job_data['role']} at {job_data['company_name']}")
+            # Final summary
+            if len(all_jobs) <= 15:
+                logger.info("ℹ️  Small job count suggests DevSunite might be a single-page site or has limited jobs")
+            elif len(all_jobs) > 20:
+                logger.info("✅ Large job count suggests successful multi-page scraping")
             
-            return job_data
+            return all_jobs
             
         except Exception as e:
-            logger.error(f"Error extracting job from card: {e}")
-            return None
-
-    def _extract_job_title(self, card):
-        """Extract job title from card based on devsunite structure"""
-        # Based on the HTML: <div class="tracking-tight text-base sm:text-lg font-semibold leading-tight text-white group-hover:text-[#2CEE91] transition-colors duration-300">Software Engineer</div>
-        title_selectors = [
-            'div[class*="tracking-tight"][class*="font-semibold"][class*="text-white"]',  # Main title selector
-            'div[class*="font-semibold"][class*="leading-tight"]',  # Alternative
-            'div[class*="text-base"][class*="sm:text-lg"]',  # Size-based selector
-            # Fallback selectors
-            'h1', 'h2', 'h3', 'h4',
-            '[class*="title"]',
-            '[class*="job-title"]',
-            'div[class*="font-semibold"]:not([class*="text-xs"])',  # Exclude small text like "Full Time"
-        ]
-        
-        for selector in title_selectors:
-            try:
-                title_elem = card.select_one(selector)
-                if title_elem:
-                    title_text = title_elem.get_text().strip()
-                    # Make sure it's not the job type badge or company name
-                    if (title_text and len(title_text) > 3 and len(title_text) < 100 and
-                        title_text.lower() not in ['full time', 'part time', 'internship', 'contract']):
-                        return title_text
-            except Exception:
-                continue
-        return None
-
-    def _extract_company_name(self, card, role_text):
-        """Extract company name from card based on devsunite structure"""
-        # Based on the HTML: <p class="text-xs font-medium text-neutral-500 uppercase tracking-wide mb-1">Irdeto</p>
-        # And: <img alt="Irdeto" loading="lazy" ...>
-        
-        # Try to get company name from image alt text first (most reliable)
+            logger.error(f"❌ Error extracting job cards: {e}")
+            return []
+    
+    def navigate_to_next_page(self) -> bool:
+        """Navigate to the next page using DevSunite-specific pagination"""
         try:
-            img_elem = card.find('img', alt=True)
-            if img_elem and img_elem.get('alt'):
-                company_name = img_elem.get('alt').strip()
-                if company_name and company_name != role_text and len(company_name) < 50:
-                    return company_name
-        except Exception:
-            pass
-        
-        # Try specific selectors for company name
-        company_selectors = [
-            'p[class*="text-xs"][class*="font-medium"][class*="text-neutral-500"][class*="uppercase"]',  # Main company selector
-            'p[class*="uppercase"][class*="tracking-wide"]',  # Alternative
-            'p[class*="text-neutral-500"][class*="mb-1"]',  # Style-based
-            # Fallback selectors
-            '[class*="company"]',
-            '[class*="employer"]',
-            'p:first-of-type',
-            'span:first-of-type'
-        ]
-        
-        for selector in company_selectors:
+            # Get current job cards to compare later
+            current_job_cards = self.driver.find_elements(By.CSS_SELECTOR, 'div[class*="rounded-lg"][class*="border-neutral-800"][class*="bg-black"]')
+            initial_job_count = len(current_job_cards)
+            logger.info(f"🔍 Initial job count: {initial_job_count}")
+            
+            # Get the first job title to track changes
+            initial_first_job_title = ""
             try:
-                company_elem = card.select_one(selector)
-                if company_elem:
-                    company_text = company_elem.get_text().strip()
-                    # Skip if it's the same as role or contains unwanted words
-                    if (company_text and company_text != role_text and 
-                        len(company_text) > 1 and len(company_text) < 50 and
-                        not any(word in company_text.lower() for word in ['apply', 'view', 'details', 'ago', 'hours', 'days', 'full time', 'part time'])):
-                        return company_text
-            except Exception:
-                continue
-        return None
-
-    def _extract_job_type(self, card):
-        """Extract job type from card based on devsunite structure"""
-        # Based on the HTML: <div class="inline-flex items-center rounded-full border px-2.5 py-0.5 font-semibold transition-colors focus:outline-none focus:ring-2 focus:ring-zinc-950 focus:ring-offset-2 border-neutral-700 bg-neutral-800 text-neutral-300 text-xs">Full Time</div>
-        
-        # Try specific selector for job type badge
-        job_type_selectors = [
-            'div[class*="inline-flex"][class*="rounded-full"][class*="px-2.5"][class*="py-0.5"]',  # Main job type badge
-            'div[class*="border-neutral-700"][class*="bg-neutral-800"][class*="text-xs"]',  # Style-based
-            'span[class*="rounded-full"][class*="px-2"]',  # Alternative badge style
-            'div[class*="badge"]',  # Generic badge
-        ]
-        
-        for selector in job_type_selectors:
+                first_job_link = current_job_cards[0].find_element(By.CSS_SELECTOR, 'a[data-testid="job-title"]')
+                initial_first_job_title = first_job_link.text.strip()
+                logger.info(f"🔍 Initial first job: {initial_first_job_title}")
+            except:
+                pass
+            
+            # Method 1: Look for next page number button (DevSunite specific)
+            logger.info("🔄 Looking for next page number button...")
             try:
-                job_type_elem = card.select_one(selector)
-                if job_type_elem:
-                    job_type_text = job_type_elem.get_text().strip().lower()
+                # First, determine current page
+                current_page = 1
+                page_buttons = self.driver.find_elements(By.XPATH, "//button[contains(@class, 'bg-[#2CEE91]')]")
+                if page_buttons:
+                    current_page_text = page_buttons[0].text.strip()
+                    if current_page_text.isdigit():
+                        current_page = int(current_page_text)
+                        logger.info(f"📄 Currently on page {current_page}")
+                
+                # Look for next page button
+                next_page = current_page + 1
+                next_page_button = self.driver.find_elements(By.XPATH, f"//button[text()='{next_page}']")
+                
+                if next_page_button and next_page_button[0].is_enabled():
+                    logger.info(f"🔄 Clicking page {next_page} button")
+                    self.driver.execute_script("arguments[0].click();", next_page_button[0])
                     
-                    if 'full time' in job_type_text or 'full-time' in job_type_text:
-                        return 'FULL_TIME'
-                    elif 'part time' in job_type_text or 'part-time' in job_type_text:
-                        return 'PART_TIME'
-                    elif 'internship' in job_type_text or 'intern' in job_type_text:
-                        return 'INTERNSHIP'
-                    elif 'contract' in job_type_text or 'freelance' in job_type_text:
-                        return 'CONTRACT'
-            except Exception:
-                continue
-        
-        # Fallback: check entire card text
-        card_text = card.get_text().lower()
-        if 'internship' in card_text or 'intern' in card_text:
-            return 'INTERNSHIP'
-        elif 'part-time' in card_text or 'part time' in card_text:
-            return 'PART_TIME'
-        elif 'contract' in card_text or 'freelance' in card_text:
-            return 'CONTRACT'
-        elif 'full-time' in card_text or 'full time' in card_text:
-            return 'FULL_TIME'
-        
-        return 'FULL_TIME'  # Default
-
-    def _extract_location(self, card):
-        """Extract location from card based on devsunite structure"""
-        # Based on the HTML: <span class="font-medium truncate">Noida</span> (inside location icon container)
-        
-        # Look for location near map pin icon
-        location_selectors = [
-            'svg[class*="lucide-map-pin"] + span',  # Span right after map pin icon
-            'svg[class*="map-pin"] ~ span',  # Any span after map pin
-            'div:has(svg[class*="map-pin"]) span[class*="font-medium"]',  # Font medium span in map pin container
-            'span[class*="truncate"]',  # Truncate class often used for location
-            # Fallback selectors
-            '[class*="location"]',
-            '[class*="place"]',
-            '[class*="city"]'
-        ]
-        
-        for selector in location_selectors:
+                    # Wait for content to change with multiple checks
+                    for wait_attempt in range(10):  # Wait up to 10 seconds
+                        time.sleep(1)
+                        
+                        # Check if first job title changed
+                        try:
+                            new_job_cards = self.driver.find_elements(By.CSS_SELECTOR, 'div[class*="rounded-lg"][class*="border-neutral-800"][class*="bg-black"]')
+                            if new_job_cards:
+                                first_job_link = new_job_cards[0].find_element(By.CSS_SELECTOR, 'a[data-testid="job-title"]')
+                                new_first_job_title = first_job_link.text.strip()
+                                
+                                if new_first_job_title != initial_first_job_title:
+                                    logger.info(f"✅ Successfully navigated to page {next_page}")
+                                    logger.info(f"🔄 First job changed: '{initial_first_job_title}' → '{new_first_job_title}'")
+                                    return True
+                        except:
+                            pass
+                    
+                    logger.info(f"⚠️ Page {next_page} clicked but content didn't change - might be same jobs or only one page of jobs")
+                    return True  # Still return True since we clicked successfully
+                else:
+                    logger.info(f"❌ Page {next_page} button not found or not enabled")
+                    
+            except Exception as e:
+                logger.info(f"⚠️ Error with page number navigation: {e}")
+            
+            # Method 2: Try right arrow/chevron navigation as fallback
+            logger.info("🔄 Looking for right arrow/chevron buttons...")
             try:
-                location_elem = card.select_one(selector)
-                if location_elem:
-                    location_text = location_elem.get_text().strip()
-                    # Skip if it looks like experience or other data
-                    if (location_text and len(location_text) < 50 and 
-                        not any(word in location_text.lower() for word in ['year', 'month', 'experience', 'apply', 'view'])):
-                        return location_text
-            except Exception:
-                continue
-        
-        # Fallback: check for common location patterns in text
-        card_text = card.get_text().lower()
-        if 'remote' in card_text:
-            return 'Remote'
-        elif 'onsite' in card_text or 'on-site' in card_text:
-            return 'Onsite'
-        elif 'hybrid' in card_text:
-            return 'Hybrid'
-        
-        return 'Not specified'
-
-    def _extract_experience(self, card):
-        """Extract experience level from card based on devsunite structure"""
-        # Based on the HTML: <span class="font-medium">0 years</span> (inside clock icon container)
-        
-        # Look for experience near clock icon
-        experience_selectors = [
-            'svg[class*="lucide-clock"] + span',  # Span right after clock icon
-            'svg[class*="clock"] ~ span',  # Any span after clock
-            'div:has(svg[class*="clock"]) span[class*="font-medium"]',  # Font medium span in clock container
-            # Fallback patterns
-            'span:contains("years")',
-            'span:contains("experience")',
-            'div:contains("years")',
-        ]
-        
-        for selector in experience_selectors:
+                right_arrow_selectors = [
+                    "button[class*='chevron-right']",
+                    "button svg[class*='chevron-right']",
+                    "button:has(svg[class*='chevron-right'])",
+                    "//button[contains(@class, 'inline-flex')]//svg[contains(@class, 'lucide-chevron-right')]/.."
+                ]
+                
+                for selector in right_arrow_selectors:
+                    try:
+                        if selector.startswith("//"):
+                            right_arrow_buttons = self.driver.find_elements(By.XPATH, selector)
+                        else:
+                            right_arrow_buttons = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                        
+                        for right_arrow_btn in right_arrow_buttons:
+                            if right_arrow_btn.is_enabled() and right_arrow_btn.is_displayed():
+                                classes = right_arrow_btn.get_attribute("class")
+                                if "disabled" not in classes.lower():
+                                    logger.info("🔄 Clicking right arrow button")
+                                    self.driver.execute_script("arguments[0].click();", right_arrow_btn)
+                                    
+                                    # Wait for content change
+                                    for wait_attempt in range(8):
+                                        time.sleep(1)
+                                        new_job_cards = self.driver.find_elements(By.CSS_SELECTOR, 'div[class*="rounded-lg"][class*="border-neutral-800"][class*="bg-black"]')
+                                        
+                                        if new_job_cards:
+                                            try:
+                                                first_job_link = new_job_cards[0].find_element(By.CSS_SELECTOR, 'a[data-testid="job-title"]')
+                                                new_first_job_title = first_job_link.text.strip()
+                                                
+                                                if new_first_job_title != initial_first_job_title:
+                                                    logger.info(f"✅ Right arrow worked! Content changed")
+                                                    return True
+                                            except:
+                                                pass
+                                    
+                                    logger.info("⚠️ Right arrow clicked but no content change detected")
+                                    return True
+                    except:
+                        continue
+                        
+            except Exception as e:
+                logger.info(f"⚠️ Could not find right arrow button: {e}")
+            
+            # Method 3: Check if this is all the jobs available
+            logger.info("🔍 Checking if all jobs are already loaded...")
             try:
-                exp_elem = card.select_one(selector)
-                if exp_elem:
-                    exp_text = exp_elem.get_text().strip()
-                    # Skip if it's location or other data
-                    if (exp_text and ('year' in exp_text.lower() or 'experience' in exp_text.lower()) and 
-                        len(exp_text) < 30):
-                        return exp_text
-            except Exception:
-                continue
-        
-        # Fallback: look for experience patterns in the entire card text
-        card_text = card.get_text().lower()
-        
-        experience_patterns = [
-            ('entry level', 'Entry Level'),
-            ('junior', 'Junior'),
-            ('senior', 'Senior'),
-            ('mid level', 'Mid Level'),
-            ('lead', 'Lead'),
-            ('principal', 'Principal'),
-            ('0 years', 'Entry Level'),
-            ('0-1 years', 'Entry Level'),
-            ('1-3 years', 'Junior'),
-            ('3-5 years', 'Mid Level'),
-            ('5+ years', 'Senior'),
-            ('fresher', 'Entry Level'),
-            ('experienced', 'Mid Level')
-        ]
-        
-        for pattern, level in experience_patterns:
-            if pattern in card_text:
-                return level
-        
-        return 'Not specified'
-
-    def _extract_description(self, card):
-        """Extract job description from card based on devsunite structure"""
-        # Based on the HTML: <p class="text-sm text-neutral-300 leading-relaxed line-clamp-3">Who we are: Irdeto is the world leader...</p>
-        
-        desc_selectors = [
-            'p[class*="text-sm"][class*="text-neutral-300"][class*="leading-relaxed"]',  # Main description
-            'p[class*="line-clamp-3"]',  # Clamped text (description)
-            'p[class*="text-neutral-300"]:not([class*="text-xs"])',  # Neutral text that's not extra small
-            # Fallback selectors
-            '[class*="description"]',
-            '[class*="summary"]',
-            'p:not(:first-child):not(:last-child)',  # Middle paragraphs
-            'p[class*="text-sm"]:not([class*="uppercase"])',  # Small text that's not uppercase (not company name)
-        ]
-        
-        for selector in desc_selectors:
-            try:
-                desc_elem = card.select_one(selector)
-                if desc_elem:
-                    desc_text = desc_elem.get_text().strip()
-                    # Make sure it's substantial content and not metadata
-                    if (desc_text and len(desc_text) > 50 and 
-                        not any(word in desc_text.lower() for word in ['compensation', 'apply now', 'view details'])):
-                        # Truncate if too long for short description
-                        if len(desc_text) > 200:
-                            return desc_text[:200] + '...'
-                        return desc_text
-            except Exception:
-                continue
-        
-        return ''
-
-    def _extract_compensation(self, card):
-        """Extract compensation/salary from card based on devsunite structure"""
-        # Based on the HTML: <span class="text-sm font-semibold text-neutral-200">6-12 LPA</span> (in compensation section)
-        
-        # Look for compensation section specifically
-        comp_selectors = [
-            'span[class*="text-sm"][class*="font-semibold"][class*="text-neutral-200"]',  # Specific styling
-            # Look for compensation in border-t section (above buttons)
-            'div[class*="border-t"] span[class*="font-semibold"]',
-            'div[class*="py-3"] span[class*="font-semibold"]',
-        ]
-        
-        for selector in comp_selectors:
-            try:
-                comp_elem = card.select_one(selector)
-                if comp_elem:
-                    comp_text = comp_elem.get_text().strip()
-                    # Make sure it's not the label itself and contains salary indicators
-                    if (comp_text and comp_text.lower() != 'compensation' and 
-                        any(indicator in comp_text.lower() for indicator in ['lpa', 'ctc', '$', '₹', '€', '£', 'salary', 'k', 'lakhs'])):
-                        return comp_text
-            except Exception:
-                continue
-        
-        # Alternative: look for text near "Compensation" label
+                # Look for end-of-results indicators
+                end_indicators = [
+                    "No more jobs",
+                    "End of results", 
+                    "That's all folks",
+                    "© 2025 DevsUnite"  # Footer indicates end of content
+                ]
+                
+                page_text = self.driver.page_source.lower()
+                for indicator in end_indicators:
+                    if indicator.lower() in page_text:
+                        logger.info(f"ℹ️  Found 'end of results' indicator - all jobs likely loaded")
+                        return False
+                        
+                # If we only have 12 jobs, this might be all DevSunite has
+                if initial_job_count <= 12:
+                    logger.info(f"ℹ️  Small job count ({initial_job_count}) suggests DevSunite might be a single-page site or has limited jobs")
+                    
+            except Exception as e:
+                logger.info(f"⚠️ Error checking for end indicators: {e}")
+            
+            logger.info("❌ No pagination method worked or all jobs already loaded")
+            return False
+            
+        except Exception as e:
+            logger.error(f"❌ Error in navigate_to_next_page: {e}")
+            return False
+    
+    def parse_job_card(self, card) -> Optional[Dict]:
+        """Parse individual job card element using proven working logic"""
         try:
-            comp_sections = card.find_all('span', string=lambda text: text and 'compensation' in text.lower())
-            for comp_section in comp_sections:
-                # Look for the next span with salary info
-                parent = comp_section.parent
-                if parent:
-                    salary_span = parent.find('span', class_=lambda classes: classes and 'font-semibold' in ' '.join(classes))
-                    if salary_span:
-                        salary_text = salary_span.get_text().strip()
-                        if salary_text and salary_text.lower() != 'compensation':
-                            return salary_text
-        except Exception:
-            pass
+            job_info = {
+                'title': 'Unknown Position',
+                'company': 'Unknown Company',
+                'location': 'Remote',
+                'experience': 'Not specified',
+                'job_type': 'Full-time',
+                'compensation': '',
+                'view_details_url': '',
+                'apply_url': '',
+                'short_description': ''
+            }
+            
+            # Extract company name - PROVEN WORKING SELECTOR
+            company_elem = card.find('p', class_=lambda x: x and 'text-xs' in x and 'font-medium' in x and 'text-neutral-500' in x and 'uppercase' in x)
+            if company_elem:
+                job_info['company'] = company_elem.get_text(strip=True)
+            
+            # Extract job title - PROVEN WORKING SELECTOR
+            title_elem = card.find('div', class_=lambda x: x and 'tracking-tight' in x and 'font-semibold' in x)
+            if title_elem:
+                job_info['title'] = title_elem.get_text(strip=True)
+            
+            # Extract location and experience - PROVEN WORKING LOGIC
+            location_spans = card.find_all('span', class_=lambda x: x and 'font-medium' in x)
+            for span in location_spans:
+                text = span.get_text(strip=True)
+                # Look for location indicators
+                if any(loc in text.lower() for loc in ['bangalore', 'mumbai', 'delhi', 'pune', 'hyderabad', 'chennai', 'remote', 'india', 'usa', 'uk', 'gurgaon', 'gurugram', 'noida']):
+                    job_info['location'] = text
+                # Look for experience indicators
+                elif 'year' in text.lower() or re.match(r'\d+\s*years?', text):
+                    job_info['experience'] = text
+            
+            # Extract job type - PROVEN WORKING SELECTOR
+            job_type_elem = card.find('div', class_=lambda x: x and 'inline-flex' in x and 'rounded-full' in x and 'border' in x)
+            if job_type_elem:
+                job_type_text = job_type_elem.get_text(strip=True).upper()
+                if 'FULL TIME' in job_type_text:
+                    job_info['job_type'] = 'FULL_TIME'
+                elif 'PART TIME' in job_type_text:
+                    job_info['job_type'] = 'PART_TIME'
+                elif 'INTERNSHIP' in job_type_text:
+                    job_info['job_type'] = 'INTERNSHIP'
+                elif 'CONTRACT' in job_type_text:
+                    job_info['job_type'] = 'CONTRACT'
+                else:
+                    job_info['job_type'] = job_type_text
+            
+            # Extract compensation - PROVEN WORKING SELECTOR
+            comp_section = card.find('div', class_=lambda x: x and 'border-t' in x and 'border-neutral-800' in x)
+            if comp_section:
+                comp_span = comp_section.find('span', class_=lambda x: x and 'font-semibold' in x and 'text-neutral-200' in x)
+                if comp_span:
+                    job_info['compensation'] = comp_span.get_text(strip=True)
+            
+            # Extract view details URL - PROVEN WORKING SELECTOR
+            view_details_link = card.find('a', href=lambda x: x and '/jobs/' in x and len(x.split('/')[-1]) > 10)
+            if view_details_link:
+                href = view_details_link.get('href')
+                if href.startswith('/'):
+                    job_info['view_details_url'] = self.base_url + href
+                else:
+                    job_info['view_details_url'] = href
+            
+            # Extract apply URL (external link)
+            apply_links = card.find_all('a', href=True)
+            for link in apply_links:
+                href = link.get('href')
+                text = link.get_text(strip=True).lower()
+                if 'apply' in text and not href.startswith('/jobs/'):
+                    job_info['apply_url'] = href
+                    break
+            
+            # Extract short description
+            desc_elem = card.find('p', class_=lambda x: x and 'text-sm' in x)
+            if desc_elem:
+                job_info['short_description'] = desc_elem.get_text(strip=True)
+            
+            # Only return if we have essential information
+            if job_info['title'] != 'Unknown Position' and job_info['company'] != 'Unknown Company':
+                return job_info
+            else:
+                return None
+            
+        except Exception as e:
+            logger.error(f"❌ Error parsing job card: {e}")
+            return None
+    
+    def clean_experience(self, experience_text: str) -> str:
+        """Clean and normalize experience text"""
+        if not experience_text:
+            return "Not specified"
         
-        # Fallback: use regex to find salary patterns in entire card
-        card_text = card.get_text()
+        # Extract years from text
+        years_match = re.search(r'(\d+).*?years?', experience_text.lower())
+        if years_match:
+            return f"{years_match.group(1)} years"
         
-        import re
-        salary_patterns = [
-            r'\d+\s*-\s*\d+\s*LPA',  # Indian format like "6-12 LPA"
-            r'\d+\s*LPA',  # Single LPA amount
-            r'\$[\d,]+(?:\s*-\s*\$?[\d,]+)?(?:\s*(?:per|\/)\s*(?:year|yr|month|mo|hour|hr))?',
-            r'₹[\d,]+(?:\s*-\s*₹?[\d,]+)?(?:\s*(?:per|\/)\s*(?:year|yr|month|mo|hour|hr))?',
-            r'€[\d,]+(?:\s*-\s*€?[\d,]+)?(?:\s*(?:per|\/)\s*(?:year|yr|month|mo|hour|hr))?',
-            r'£[\d,]+(?:\s*-\s*£?[\d,]+)?(?:\s*(?:per|\/)\s*(?:year|yr|month|mo|hour|hr))?'
-        ]
+        # Check for entry level indicators
+        entry_indicators = ['entry', 'fresher', 'graduate', '0 year', 'no experience']
+        if any(indicator in experience_text.lower() for indicator in entry_indicators):
+            return "0 years"
         
-        for pattern in salary_patterns:
-            match = re.search(pattern, card_text, re.IGNORECASE)
-            if match:
-                return match.group(0)
+        return experience_text.strip()
+    
+    def scrape_job_details(self, job_url: str) -> Dict:
+        """Enhanced job details scraping with better skills extraction"""
+        try:
+            logger.info(f"🔍 Scraping job details from: {job_url}")
+            self.driver.get(job_url)
+            time.sleep(3)  # Wait for content to load
+            
+            soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+            
+            # Extract full job description with multiple fallback strategies
+            full_description = ""
+            
+            # Strategy 1: Look for DevSunite-specific content containers
+            devsunite_selectors = [
+                'div[class*="job-description"]',
+                'div[class*="description"]',
+                'div[class*="content"]',
+                'section[class*="job"]',
+                'article',
+                '.prose',  # Common for rich text content
+                '[data-testid*="description"]',
+                '[data-testid*="content"]'
+            ]
+            
+            for selector in devsunite_selectors:
+                desc_elem = soup.select_one(selector)
+                if desc_elem:
+                    # Remove unwanted elements
+                    for unwanted in desc_elem.find_all(['script', 'style', 'nav', 'header', 'footer']):
+                        unwanted.decompose()
+                    
+                    full_description = desc_elem.get_text(separator='\n', strip=True)
+                    if len(full_description) > 100:  # Ensure we got substantial content
+                        logger.info(f"📄 Found description using selector: {selector}")
+                        break
+            
+            # Strategy 2: If no specific description found, get main content
+            if not full_description or len(full_description) < 100:
+                main_selectors = ['main', '[role="main"]', '#main', '.main-content', 'body']
+                
+                for selector in main_selectors:
+                    main_content = soup.select_one(selector)
+                    if main_content:
+                        # Remove navigation, header, footer, and sidebar elements
+                        for elem in main_content.find_all(['nav', 'header', 'footer', 'aside', 'script', 'style']):
+                            elem.decompose()
+                        
+                        # Also remove elements that are likely navigation or UI
+                        for elem in main_content.find_all(class_=re.compile(r'nav|menu|sidebar|footer|header', re.I)):
+                            elem.decompose()
+                        
+                        content = main_content.get_text(separator='\n', strip=True)
+                        if len(content) > len(full_description):
+                            full_description = content
+                            logger.info(f"📄 Found description using main selector: {selector}")
+                            break
+            
+            # Strategy 3: Extract from page title and meta if still no content
+            if not full_description or len(full_description) < 50:
+                title = soup.find('title')
+                meta_desc = soup.find('meta', attrs={'name': 'description'})
+                
+                title_text = title.get_text(strip=True) if title else ""
+                meta_text = meta_desc.get('content', '') if meta_desc else ""
+                
+                full_description = f"{title_text}\n{meta_text}".strip()
+                logger.info("📄 Using title and meta description as fallback")
+            
+            # Clean up the description
+            if full_description:
+                # Remove excessive whitespace and normalize
+                full_description = re.sub(r'\n\s*\n', '\n\n', full_description)
+                full_description = re.sub(r'[ \t]+', ' ', full_description)
+                full_description = full_description.strip()
+            
+            # Extract skills from structured "Required Skills" sections on the job page
+            skills = self._extract_required_skills_from_page(soup)
+            
+            logger.info(f"✅ Extracted job details: {len(full_description)} chars, {len(skills)} skills")
+            
+            return {
+                'full_description': full_description,
+                'skills_required': skills
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Error scraping job details from {job_url}: {e}")
+            return {
+                'full_description': "",
+                'skills_required': []
+            }
+    
+    def _extract_structured_skills(self, soup) -> List[str]:
+        """Extract skills from structured page elements"""
+        skills = set()
         
-        return ''
-
-    def _extract_skills(self, card):
-        """Extract skills from card"""
-        skills = []
-        
-        # Look for skill tags or badges (but exclude job type badges)
+        # Look for skill tags or badges
         skill_selectors = [
-            '[class*="skill"]',
-            '[class*="tag"]:not([class*="rounded-full"])',  # Exclude job type badges
-            '[class*="badge"]:not([class*="rounded-full"])',  # Exclude job type badges
-            '[class*="tech"]',
-            '.bg-blue-100',
-            '.bg-gray-100'
+            '.skill', '.tag', '.badge', '.chip',
+            '[class*="skill"]', '[class*="tag"]', '[class*="badge"]',
+            '.technology', '.tech', '[class*="tech"]'
         ]
         
         for selector in skill_selectors:
-            try:
-                skill_elems = card.select(selector)
-                for elem in skill_elems:
-                    skill_text = elem.get_text().strip()
-                    # Clean up the skill text and avoid duplicates
-                    # Also exclude common non-skill text
-                    if (skill_text and len(skill_text) < 30 and 
-                        skill_text not in skills and
-                        '\n' not in skill_text and
-                        skill_text.lower() not in ['full time', 'part time', 'internship', 'contract', 'remote', 'onsite', 'hybrid']):
-                        skills.append(skill_text)
-            except Exception:
-                continue
+            elements = soup.select(selector)
+            for elem in elements:
+                text = elem.get_text(strip=True)
+                if self._is_valid_skill(text) and len(text) < 30:
+                    skills.add(text)
         
-        return skills[:10]  # Limit to 10 skills
-
-    def _extract_links(self, card):
-        """Extract apply link and view details link from card based on devsunite structure"""
-        # Based on the HTML from example:
-        # <a class="inline-flex items-center justify-center gap-2 whitespace-nowrap text-sm font-medium ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 [&amp;_svg]:pointer-events-none [&amp;_svg]:size-4 [&amp;_svg]:shrink-0 border hover:text-accent-foreground h-9 rounded-md px-3 flex-1 min-w-[120px] border-neutral-700 bg-neutral-900 hover:bg-neutral-800 hover:border-neutral-600 text-neutral-200 transition-all duration-300" href="/jobs/6rN07maF7MvYvJwuUFNh"><span class="whitespace-nowrap">View Details</span></a>
-        
-        apply_link = None
-        view_details_link = None
-        
-        # Look for links in the card
-        links = card.find_all('a', href=True)
-        
-        for link in links:
-            href = link.get('href')
-            link_text = link.get_text().lower().strip()
+        # Look for structured lists that might contain skills
+        lists = soup.find_all(['ul', 'ol'])
+        for list_elem in lists:
+            # Check if this might be a skills list based on context
+            list_context = ""
+            prev_elem = list_elem.find_previous(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'div'])
+            if prev_elem:
+                list_context = prev_elem.get_text(strip=True).lower()
             
-            if not href:
-                continue
-                
-            # Check for the exact class structure from the example
-            class_attr = link.get('class', [])
-            class_str = ' '.join(class_attr) if isinstance(class_attr, list) else str(class_attr)
-            
-            # Match link by text content first
-            if 'view details' in link_text:
-                logger.info(f"Found view details link by text: {href}")
-                # Make sure it's a full URL
-                if not href.startswith('http'):
-                    if href.startswith('/'):
-                        view_details_link = f"https://devsunite.com{href}"
-                    else:
-                        view_details_link = f"https://devsunite.com/{href}"
-                else:
-                    view_details_link = href
-                    
-            # Match apply link by text
-            elif 'apply now' in link_text or 'apply' in link_text:
-                logger.info(f"Found apply link by text: {href}")
-                # Apply links are usually external (full URLs)
-                apply_link = href
-            
-            # Also check link class attributes
-            elif ('border-neutral-700' in class_str or 'bg-neutral-900' in class_str) and not view_details_link:
-                # This matches the example class structure for view details link
-                logger.info(f"Found view details link by class attributes: {href}")
-                if not href.startswith('http'):
-                    if href.startswith('/'):
-                        view_details_link = f"https://devsunite.com{href}"
-                    else:
-                        view_details_link = f"https://devsunite.com/{href}"
-                else:
-                    view_details_link = href
-                
-            # Fallback: check href patterns
-            elif '/jobs/' in href and not view_details_link:
-                # If it contains /jobs/ it's likely a view details link
-                logger.info(f"Found view details link by URL pattern: {href}")
-                if not href.startswith('http'):
-                    if href.startswith('/'):
-                        view_details_link = f"https://devsunite.com{href}"
-                    else:
-                        view_details_link = f"https://devsunite.com/{href}"
-                else:
-                    view_details_link = href
+            if any(keyword in list_context for keyword in ['skill', 'requirement', 'technology', 'tool', 'experience']):
+                items = list_elem.find_all('li')
+                for item in items[:10]:  # Limit to prevent noise
+                    text = item.get_text(strip=True)
+                    if self._is_valid_skill(text) and len(text) < 50:
+                        skills.add(text)
         
-        return apply_link, view_details_link
+        return list(skills)
     
-    def _get_full_description_selenium(self, job_url, driver):
-        """Get full job description using Selenium based on the provided example HTML structure"""
-        try:
-            logger.info(f"Fetching detailed job information from: {job_url}")
-            driver.get(job_url)
-            WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.TAG_NAME, "main"))
-            )
-            # Give extra time for all elements to render
-            time.sleep(2)
+    def _extract_required_skills_from_page(self, soup) -> List[str]:
+        """Extract skills specifically from DevSunite's 'Required Skills' sections"""
+        skills = set()
+        
+        # DevSunite-specific structure: Look for the exact HTML pattern
+        # <div class="bg-gradient-to-br from-zinc-900/90 to-zinc-950/90 ...">
+        #   <h2 class="text-xl font-bold text-white mb-6 ...">Required Skills</h2>
+        #   <div class="flex flex-wrap gap-3">
+        #     <span class="px-4 py-2 bg-[#2CEE91]/10 ...">Python</span>
+        #     <span class="px-4 py-2 bg-[#2CEE91]/10 ...">LLMs</span>
+        
+        logger.info("🔍 Searching for DevSunite-specific Required Skills section...")
+        
+        # Method 1: Target the exact DevSunite skills container
+        skills_containers = soup.find_all('div', class_=lambda x: x and 'bg-gradient-to-br' in x and 'from-zinc-900' in x)
+        
+        for container in skills_containers:
+            # Check if this container has "Required Skills" heading
+            heading = container.find('h2', string=re.compile(r'required\s+skills', re.I))
+            if not heading:
+                heading = container.find(['h1', 'h2', 'h3', 'h4'], string=re.compile(r'required\s+skills|skills\s+required|technical\s+skills|key\s+skills', re.I))
             
-            soup = BeautifulSoup(driver.page_source, 'html.parser')
-            details = {}
+            if heading:
+                logger.info(f"✅ Found DevSunite skills container with heading: {heading.get_text(strip=True)}")
+                
+                # Look for skill spans with the specific styling
+                skill_spans = container.find_all('span', class_=lambda x: x and 'px-4' in x and 'py-2' in x and 'bg-[#2CEE91]' in x)
+                
+                for span in skill_spans:
+                    skill_text = span.get_text(strip=True)
+                    if skill_text and len(skill_text) < 50:
+                        skills.add(skill_text)
+                        logger.info(f"🎯 Found skill: {skill_text}")
+                
+                # Also check for any other spans in the flex container
+                flex_container = container.find('div', class_=lambda x: x and 'flex' in x and 'flex-wrap' in x)
+                if flex_container:
+                    all_spans = flex_container.find_all('span')
+                    for span in all_spans:
+                        skill_text = span.get_text(strip=True)
+                        if skill_text and len(skill_text) < 50 and self._looks_like_skill(skill_text):
+                            skills.add(skill_text)
+        
+        # Method 2: Look for any section with "Required Skills" heading (fallback)
+        if not skills:
+            logger.info("🔍 Fallback: Looking for any Required Skills headings...")
             
-            # Extract job title if not already found - usually in the header section
-            title_selectors = [
-                'h1.text-3xl',  # Main job title based on devsunite pattern
-                'h1', 
-                '[class*="title"]',
-                '[class*="job-title"]'
-            ]
-            for selector in title_selectors:
-                title_elem = soup.select_one(selector)
-                if title_elem:
-                    details['role'] = title_elem.get_text().strip()
+            skills_headings = []
+            for heading_tag in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+                headings = soup.find_all(heading_tag)
+                for heading in headings:
+                    heading_text = heading.get_text(strip=True).lower()
+                    if any(keyword in heading_text for keyword in [
+                        'required skills', 'skills required', 'technical skills', 
+                        'key skills', 'core skills', 'essential skills',
+                        'must have skills', 'skills needed', 'technologies',
+                        'tech stack', 'technology stack'
+                    ]):
+                        skills_headings.append(heading)
+                        logger.info(f"🔍 Found skills section: '{heading.get_text(strip=True)}'")
+            
+            # Extract skills from sections following these headings
+            for heading in skills_headings:
+                skills_found_in_section = self._extract_skills_from_section(heading)
+                skills.update(skills_found_in_section)
+                logger.info(f"📋 Extracted {len(skills_found_in_section)} skills from section: {heading.get_text(strip=True)}")
+        
+        # Method 3: Look for skills in any structured elements (badges, tags, etc.)
+        if not skills:
+            logger.info("🔍 Fallback: Looking for structured skill elements...")
+            structured_skills = self._extract_skills_from_structured_elements(soup)
+            skills.update(structured_skills)
+        
+        # Method 4: Look for skills in data attributes
+        attribute_skills = self._extract_skills_from_attributes(soup)
+        skills.update(attribute_skills)
+        
+        # Clean and validate all found skills
+        cleaned_skills = []
+        for skill in skills:
+            cleaned = self._clean_skill(skill)
+            if cleaned and self._is_valid_skill(cleaned) and len(cleaned) >= 2:
+                # Split concatenated skills
+                split_skills = self._split_concatenated_skills(cleaned)
+                for split_skill in split_skills:
+                    if split_skill and len(split_skill) >= 2:
+                        cleaned_skills.append(split_skill)
+        
+        # Remove duplicates and filter out concatenated versions when we have individual components
+        final_skills = self._deduplicate_skills(cleaned_skills)
+        final_skills = self._filter_concatenated_duplicates(final_skills)
+        
+        logger.info(f"🎯 Final skills extracted from DevSunite page: {len(final_skills)}")
+        return final_skills[:20]  # Limit to top 20 skills
+    
+    def _extract_skills_from_section(self, heading) -> List[str]:
+        """Extract skills from content following a skills heading"""
+        skills = set()
+        
+        # Get the parent container of the heading
+        section_container = heading.parent
+        if not section_container:
+            return list(skills)
+        
+        # Look for lists immediately following the heading
+        next_elements = []
+        
+        # Method 1: Look for next siblings
+        current = heading
+        for _ in range(5):  # Check next 5 elements
+            current = current.find_next_sibling()
+            if current:
+                next_elements.append(current)
+            else:
+                break
+        
+        # Method 2: Look within the parent container
+        container_lists = section_container.find_all(['ul', 'ol'], limit=3)
+        next_elements.extend(container_lists)
+        
+        # Method 3: Look for divs with skill-like content
+        skill_divs = section_container.find_all('div', class_=re.compile(r'skill|tag|badge|chip', re.I), limit=10)
+        next_elements.extend(skill_divs)
+        
+        # Extract skills from found elements
+        for element in next_elements:
+            if element.name in ['ul', 'ol']:
+                # Extract from list items
+                list_items = element.find_all('li')
+                for item in list_items:
+                    skill_text = item.get_text(strip=True)
+                    # Split concatenated skills by common patterns
+                    individual_skills = self._split_concatenated_skills(skill_text)
+                    for skill in individual_skills:
+                        if skill and len(skill) < 50:  # Reasonable skill length
+                            skills.add(skill)
+            
+            elif element.name == 'div':
+                # Check if this div contains skill-like content
+                div_text = element.get_text(strip=True)
+                
+                # Split concatenated skills
+                individual_skills = self._split_concatenated_skills(div_text)
+                for skill in individual_skills:
+                    if len(skill) < 30 and self._looks_like_skill(skill):
+                        skills.add(skill)
+                
+                # Also check for nested spans or other elements
+                skill_elements = element.find_all(['span', 'a', 'button'], limit=20)
+                for skill_elem in skill_elements:
+                    skill_text = skill_elem.get_text(strip=True)
+                    individual_skills = self._split_concatenated_skills(skill_text)
+                    for skill in individual_skills:
+                        if skill and len(skill) < 30 and self._looks_like_skill(skill):
+                            skills.add(skill)
+            
+            elif element.name == 'p':
+                # For paragraphs, try to extract comma-separated skills
+                para_text = element.get_text(strip=True)
+                if len(para_text) < 200:  # Not too long
+                    # Split by common delimiters and handle concatenated skills
+                    potential_skills = re.split(r'[,;•|]|\sand\s|\sor\s', para_text)
+                    for skill in potential_skills:
+                        individual_skills = self._split_concatenated_skills(skill.strip())
+                        for individual_skill in individual_skills:
+                            if individual_skill and len(individual_skill) < 30 and self._looks_like_skill(individual_skill):
+                                skills.add(individual_skill)
+        
+        return list(skills)
+    
+    def _split_concatenated_skills(self, text: str) -> List[str]:
+        """Split concatenated skills like 'Pythonllmsai/Ml' into individual skills"""
+        if not text or len(text) < 3:
+            return [text] if text else []
+        
+        text = text.strip()
+        
+        # If it's already a clean single skill, return it
+        if len(text) < 20 and ' ' not in text and self._is_single_clean_skill(text):
+            return [text]
+        
+        # Common patterns to split concatenated skills
+        skills = []
+        
+        # Pattern 1: Split by common delimiters first
+        if any(delim in text for delim in [',', ';', '|', '•', '/', ' and ', ' & ']):
+            parts = re.split(r'[,;|•/]|\sand\s|\s&\s', text)
+            for part in parts:
+                part = part.strip()
+                if part and len(part) >= 2:
+                    # Don't recursively split if it's already reasonable
+                    if len(part) < 25 and self._looks_like_skill(part):
+                        skills.append(part)
+            return skills if skills else [text]
+        
+        # Pattern 2: Split by known technology names (exact matches) - Enhanced list
+        known_techs = [
+            # AI/ML Terms
+            'AI/ML', 'AI', 'ML', 'Machine Learning', 'Deep Learning', 'LLMs', 'LLM',
+            'TensorFlow', 'PyTorch', 'Scikit-learn', 'Pandas', 'NumPy',
+            
+            # Programming Languages
+            'JavaScript', 'TypeScript', 'Python', 'Java', 'C++', 'C#', 'PHP', 'Ruby', 
+            'Go', 'Rust', 'Swift', 'Kotlin', 'Scala', 'R', 'MATLAB',
+            
+            # Web Technologies
+            'React.js', 'React', 'Angular', 'Vue.js', 'Vue', 'Next.js', 'Nuxt.js',
+            'Node.js', 'Express.js', 'Express', 'Svelte', 'jQuery',
+            'HTML5', 'HTML', 'CSS3', 'CSS', 'SASS', 'SCSS', 'Bootstrap', 'Tailwind',
+            'Material-UI', 'Ant Design', 'Chakra UI',
+            
+            # Backend Frameworks
+            'Django', 'Flask', 'FastAPI', 'Spring Boot', 'Spring', 'Laravel', 
+            'Ruby on Rails', 'ASP.NET', 'Symfony', 'Koa.js',
+            
+            # Databases
+            'PostgreSQL', 'MySQL', 'MongoDB', 'Redis', 'SQLite', 'Oracle',
+            'SQL Server', 'DynamoDB', 'Cassandra', 'Elasticsearch', 'Neo4j',
+            
+            # Cloud & DevOps
+            'AWS', 'Azure', 'GCP', 'Google Cloud', 'Docker', 'Kubernetes', 'Jenkins',
+            'GitLab CI', 'GitHub Actions', 'Terraform', 'Ansible', 'Vagrant',
+            
+            # Version Control & Tools
+            'Git', 'GitHub', 'GitLab', 'Bitbucket', 'JIRA', 'Confluence',
+            'VS Code', 'IntelliJ', 'Eclipse', 'Postman', 'Swagger',
+            
+            # APIs & Protocols
+            'GraphQL', 'REST API', 'REST', 'gRPC', 'JSON', 'XML', 'SOAP',
+            
+            # Testing
+            'Jest', 'Mocha', 'Selenium', 'Cypress', 'JUnit', 'PyTest',
+            'Unit Testing', 'Integration Testing', 'TDD', 'BDD',
+            
+            # Mobile
+            'React Native', 'Flutter', 'iOS', 'Android', 'Xamarin', 'Ionic',
+            
+            # Build Tools
+            'Webpack', 'Babel', 'Vite', 'Parcel', 'Rollup', 'Grunt', 'Gulp',
+            
+            # Methodologies
+            'Agile', 'Scrum', 'Kanban', 'DevOps', 'CI/CD'
+        ]
+        
+        # Sort by length (longest first) to match longer terms first
+        known_techs_sorted = sorted(known_techs, key=len, reverse=True)
+        
+        found_skills = []
+        remaining_text = text
+        
+        for tech in known_techs_sorted:
+            # Look for exact matches (case insensitive)
+            tech_lower = tech.lower()
+            remaining_lower = remaining_text.lower()
+            
+            if tech_lower in remaining_lower:
+                start_idx = remaining_lower.find(tech_lower)
+                # Check if it's a word boundary match (not part of another word)  
+                if start_idx != -1:
+                    # For concatenated skills, be more flexible with boundaries
+                    # Allow matching even if characters are adjacent (for concatenated strings)
+                    is_word_start = start_idx == 0 or not remaining_text[start_idx-1].isalpha() or start_idx == 0
+                    end_idx = start_idx + len(tech)
+                    is_word_end = end_idx >= len(remaining_text) or not remaining_text[end_idx].isalpha() or end_idx == len(remaining_text)
+                    
+                    # For concatenated skills, we want to match even when letters are adjacent
+                    if tech_lower in remaining_lower:
+                        # Get the actual case from the original text
+                        actual_match = remaining_text[start_idx:start_idx + len(tech)]
+                        found_skills.append(tech)  # Use the standard capitalization
+                        # Remove this match from remaining text
+                        remaining_text = remaining_text[:start_idx] + remaining_text[end_idx:]
+                        remaining_text = re.sub(r'\s+', ' ', remaining_text).strip()
+                        break  # Important: break to avoid multiple matches of the same tech
+        
+        # Handle remaining text
+        if remaining_text and len(remaining_text) >= 2:
+            # Clean up remaining text
+            remaining_text = re.sub(r'[^\w\s.-]', '', remaining_text).strip()
+            if remaining_text and self._looks_like_skill(remaining_text):
+                found_skills.append(remaining_text)
+        
+        # If we found skills through pattern matching, return them
+        if found_skills:
+            return found_skills
+        
+        # If no patterns matched and it's not too long, return the original
+        if len(text) <= 30:
+            return [text]
+        
+        # For very long concatenated strings, try camelCase splitting as last resort
+        if len(text) > 8:  # Reduced threshold to catch more concatenated skills
+            # Enhanced camelCase splitting for cases like "Reacthtml", "Nodejsgit"
+            parts = re.findall(r'[A-Z][a-z]*\.?[a-z]*|[a-z]+|[A-Z]+(?=[A-Z][a-z]|\b)', text)
+            if len(parts) > 1:
+                valid_parts = []
+                
+                # Try to reconstruct meaningful skills from parts
+                i = 0
+                while i < len(parts):
+                    current_part = parts[i]
+                    
+                    # Check if current part combined with next part makes a known skill
+                    if i + 1 < len(parts):
+                        combined = current_part + parts[i + 1]
+                        if any(tech.lower() == combined.lower() for tech in known_techs_sorted):
+                            valid_parts.append(combined)
+                            i += 2
+                            continue
+                        
+                        # Also try with dots (like Node.js)
+                        combined_with_dot = current_part + '.' + parts[i + 1]
+                        if any(tech.lower() == combined_with_dot.lower() for tech in known_techs_sorted):
+                            valid_parts.append(combined_with_dot)
+                            i += 2
+                            continue
+                    
+                    # Check if current part is valid on its own
+                    if len(current_part) >= 2 and (
+                        self._looks_like_skill(current_part) or 
+                        any(tech.lower() == current_part.lower() for tech in known_techs_sorted)
+                    ):
+                        valid_parts.append(current_part)
+                    
+                    i += 1
+                
+                if len(valid_parts) >= 2:
+                    return valid_parts
+            
+            # Alternative approach: try splitting known concatenations
+            # Look for known patterns like "reacthtml", "nodejsgit", etc.
+            text_lower = text.lower()
+            for tech in known_techs_sorted:
+                tech_lower = tech.lower()
+                if tech_lower in text_lower and len(tech_lower) < len(text_lower):
+                    # Found a technology in the text, try to split around it
+                    before_tech = text_lower[:text_lower.find(tech_lower)]
+                    after_tech = text_lower[text_lower.find(tech_lower) + len(tech_lower):]
+                    
+                    result_parts = []
+                    
+                    # Add the main technology
+                    result_parts.append(tech)
+                    
+                    # Check if before/after parts are also technologies
+                    if before_tech:
+                        for other_tech in known_techs_sorted:
+                            if other_tech.lower() == before_tech:
+                                result_parts.insert(0, other_tech)
+                                break
+                    
+                    if after_tech:
+                        for other_tech in known_techs_sorted:
+                            if other_tech.lower() == after_tech:
+                                result_parts.append(other_tech)
+                                break
+                    
+                    if len(result_parts) >= 2:
+                        return result_parts
+        
+        return [text]
+    
+    def _is_single_clean_skill(self, text: str) -> bool:
+        """Check if text is already a clean single skill"""
+        if not text or len(text) < 2:
+            return False
+        
+        # Common clean skills
+        clean_skills = [
+            'python', 'java', 'javascript', 'typescript', 'react', 'angular', 'vue',
+            'node.js', 'express', 'django', 'flask', 'spring', 'html', 'css',
+            'postgresql', 'mysql', 'mongodb', 'redis', 'git', 'docker', 'kubernetes',
+            'aws', 'azure', 'gcp', 'graphql', 'rest', 'api', 'json', 'xml',
+            'bootstrap', 'tailwind', 'sass', 'scss', 'webpack', 'babel', 'junit',
+            'jest', 'mocha', 'cypress', 'selenium', 'jenkins', 'gitlab', 'github'
+        ]
+        
+        return text.lower() in clean_skills or (len(text) <= 15 and not any(char.isdigit() for char in text))
+    
+    def _extract_skills_from_structured_elements(self, soup) -> List[str]:
+        """Extract skills from structured page elements like tags, badges, chips"""
+        skills = set()
+        
+        # Look for elements that typically contain skills
+        skill_element_selectors = [
+            # Class-based selectors for common skill UI elements
+            '.skill', '.tag', '.badge', '.chip', '.pill',
+            '[class*="skill"]', '[class*="tag"]', '[class*="badge"]',
+            '[class*="chip"]', '[class*="pill"]',
+            '.technology', '.tech', '[class*="tech"]',
+            '.requirement', '[class*="requirement"]',
+            # Data attributes
+            '[data-skill]', '[data-tag]', '[data-technology]',
+            # Specific to job sites
+            '.job-skill', '.job-tag', '.job-requirement',
+            '[class*="job-skill"]', '[class*="job-tag"]'
+        ]
+        
+        for selector in skill_element_selectors:
+            try:
+                elements = soup.select(selector)
+                for elem in elements:
+                    # Get text content
+                    text = elem.get_text(strip=True)
+                    if text and len(text) < 50 and self._looks_like_skill(text):
+                        skills.add(text)
+                    
+                    # Also check data attributes
+                    for attr in ['data-skill', 'data-tag', 'data-technology', 'title', 'alt']:
+                        attr_value = elem.get(attr)
+                        if attr_value and len(attr_value) < 50 and self._looks_like_skill(attr_value):
+                            skills.add(attr_value)
+            except Exception as e:
+                continue
+        
+        return list(skills)
+    
+    def _extract_skills_from_attributes(self, soup) -> List[str]:
+        """Extract skills from data attributes or other element attributes"""
+        skills = set()
+        
+        # Look for elements with skill-related data attributes
+        attribute_selectors = [
+            '[data-skill]',
+            '[data-skills]', 
+            '[data-tag]',
+            '[data-tags]',
+            '[data-technology]',
+            '[data-technologies]',
+            '[data-requirement]',
+            '[data-requirements]'
+        ]
+        
+        for selector in attribute_selectors:
+            try:
+                elements = soup.select(selector)
+                for elem in elements:
+                    for attr in ['data-skill', 'data-skills', 'data-tag', 'data-tags', 
+                                'data-technology', 'data-technologies', 'data-requirement', 'data-requirements']:
+                        attr_value = elem.get(attr)
+                        if attr_value:
+                            # Handle comma-separated values
+                            if ',' in attr_value:
+                                skill_list = [s.strip() for s in attr_value.split(',')]
+                                for skill in skill_list:
+                                    if skill and self._looks_like_skill(skill):
+                                        skills.add(skill)
+                            else:
+                                if self._looks_like_skill(attr_value):
+                                    skills.add(attr_value)
+            except Exception as e:
+                continue
+        
+        return list(skills)
+    
+    def _looks_like_skill(self, text: str) -> bool:
+        """Quick check if text looks like a technical skill"""
+        if not text or len(text.strip()) < 2:
+            return False
+        
+        text = text.strip().lower()
+        
+        # Too long or too short
+        if len(text) > 50 or len(text) < 2:
+            return False
+        
+        # Common technical terms that indicate skills
+        tech_indicators = [
+            'python', 'java', 'javascript', 'react', 'node', 'sql', 'html', 'css',
+            'aws', 'docker', 'kubernetes', 'git', 'api', 'rest', 'graphql',
+            'mongodb', 'postgresql', 'mysql', 'redis', 'django', 'flask',
+            'angular', 'vue', 'typescript', 'go', 'rust', 'swift', 'kotlin',
+            'machine learning', 'ai', 'data science', 'devops', 'ci/cd',
+            'agile', 'scrum', 'jenkins', 'terraform', 'ansible'
+        ]
+        
+        # If it contains common tech terms, likely a skill
+        if any(indicator in text for indicator in tech_indicators):
+            return True
+        
+        # If it's short and doesn't contain common non-skill words, might be a skill
+        non_skill_words = [
+            'the', 'and', 'or', 'in', 'on', 'at', 'to', 'for', 'with', 'of',
+            'is', 'are', 'be', 'have', 'has', 'will', 'can', 'must', 'should',
+            'years', 'experience', 'knowledge', 'skills', 'ability', 'bachelor',
+            'degree', 'certification', 'location', 'salary', 'remote', 'job',
+            'position', 'role', 'company', 'team', 'work', 'candidate'
+        ]
+        
+        words = text.split()
+        if len(words) <= 3:  # Short phrases are more likely to be skills
+            non_skill_count = sum(1 for word in words if word in non_skill_words)
+            if non_skill_count == 0:  # No common non-skill words
+                return True
+        
+        return False
+    
+    def extract_skills(self, soup, description_text: str) -> List[str]:
+        """Enhanced skills extraction from job description with comprehensive patterns"""
+        skills = set()  # Use set to avoid duplicates
+        
+        # 1. Look for structured skills sections
+        skills_keywords = [
+            'skills', 'requirements', 'technologies', 'qualifications', 'must have',
+            'technical skills', 'key skills', 'required skills', 'core skills',
+            'technology stack', 'tech stack', 'tools', 'experience with'
+        ]
+        
+        for keyword in skills_keywords:
+            # Find sections with skills-related headings
+            headings = soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'strong', 'b'], 
+                                   string=re.compile(keyword, re.I))
+            
+            for heading in headings:
+                # Get the next siblings that contain skills
+                current = heading.parent
+                if current:
+                    # Look for lists after the heading
+                    next_elements = current.find_next_siblings(['ul', 'ol', 'div', 'p'], limit=3)
+                    for element in next_elements:
+                        skill_items = element.find_all(['li', 'span'])
+                        for item in skill_items:
+                            skill_text = item.get_text(strip=True)
+                            if self._is_valid_skill(skill_text):
+                                skills.add(skill_text)
+        
+        # 2. Enhanced tech skills pattern matching with more comprehensive coverage
+        tech_patterns = {
+            # Programming Languages
+            'languages': r'\b(Python|Java|JavaScript|TypeScript|C\+\+|C#|PHP|Ruby|Go|Rust|Kotlin|Swift|Scala|R|MATLAB|Perl|Shell|Bash)\b',
+            
+            # Web Technologies
+            'web_frontend': r'\b(React|Angular|Vue\.js|Next\.js|Nuxt\.js|Svelte|HTML5?|CSS3?|SASS|SCSS|Less|Bootstrap|Tailwind|Material-UI|Ant Design)\b',
+            'web_backend': r'\b(Node\.js|Express\.js|Django|Flask|FastAPI|Spring|Laravel|Ruby on Rails|ASP\.NET|Symfony|Koa\.js)\b',
+            
+            # Databases
+            'databases': r'\b(MySQL|PostgreSQL|MongoDB|Redis|SQLite|Oracle|SQL Server|DynamoDB|Cassandra|Elasticsearch|InfluxDB|Neo4j)\b',
+            
+            # Cloud & DevOps
+            'cloud': r'\b(AWS|Azure|GCP|Google Cloud|Docker|Kubernetes|Jenkins|GitLab CI|GitHub Actions|Terraform|Ansible|Vagrant)\b',
+            'devops': r'\b(CI/CD|DevOps|Microservices|API|REST|GraphQL|gRPC|Nginx|Apache|Load Balancing)\b',
+            
+            # Data & AI
+            'data_ai': r'\b(Machine Learning|Deep Learning|AI|Data Science|TensorFlow|PyTorch|Scikit-learn|Pandas|NumPy|Jupyter|Apache Spark|Hadoop|Kafka)\b',
+            'analytics': r'\b(Power BI|Tableau|D3\.js|Chart\.js|Google Analytics|SQL|NoSQL|ETL|Data Mining|Statistics)\b',
+            
+            # Mobile
+            'mobile': r'\b(React Native|Flutter|iOS|Android|Xamarin|Ionic|Cordova|Swift|Objective-C|Dart)\b',
+            
+            # Tools & Others
+            'tools': r'\b(Git|GitHub|GitLab|Bitbucket|JIRA|Confluence|Slack|VS Code|IntelliJ|Eclipse|Postman|Swagger)\b',
+            'testing': r'\b(Jest|Mocha|Selenium|Cypress|JUnit|PyTest|Unit Testing|Integration Testing|TDD|BDD)\b',
+            
+            # Methodologies
+            'methodologies': r'\b(Agile|Scrum|Kanban|Waterfall|Lean|Six Sigma|ITIL|Prince2)\b'
+        }
+        
+        for category, pattern in tech_patterns.items():
+            matches = re.findall(pattern, description_text, re.IGNORECASE)
+            for match in matches:
+                skills.add(match)
+        
+        # 3. Extract skills from common patterns
+        skill_patterns = [
+            # "Experience with X, Y, Z"
+            r'experience\s+with\s+([^.]+?)(?:\.|,|\n|$)',
+            # "Knowledge of X, Y, Z"
+            r'knowledge\s+of\s+([^.]+?)(?:\.|,|\n|$)',
+            # "Proficient in X, Y, Z"
+            r'proficient\s+in\s+([^.]+?)(?:\.|,|\n|$)',
+            # "Familiar with X, Y, Z"
+            r'familiar\s+with\s+([^.]+?)(?:\.|,|\n|$)',
+            # "Working knowledge of X, Y, Z"
+            r'working\s+knowledge\s+of\s+([^.]+?)(?:\.|,|\n|$)',
+            # "Strong understanding of X, Y, Z"
+            r'strong\s+understanding\s+of\s+([^.]+?)(?:\.|,|\n|$)',
+        ]
+        
+        for pattern in skill_patterns:
+            matches = re.findall(pattern, description_text, re.IGNORECASE | re.MULTILINE)
+            for match in matches:
+                # Split by common delimiters
+                skill_list = re.split(r'[,;&]|and\s+|or\s+', match)
+                for skill in skill_list:
+                    cleaned_skill = skill.strip()
+                    if self._is_valid_skill(cleaned_skill):
+                        skills.add(cleaned_skill)
+        
+        # 4. Extract skills from bullet points and lists
+        list_items = soup.find_all(['li'])
+        for item in list_items:
+            text = item.get_text(strip=True)
+            if self._is_valid_skill(text) and len(text) < 50:
+                skills.add(text)
+        
+        # 5. Clean and normalize skills
+        cleaned_skills = []
+        for skill in skills:
+            cleaned = self._clean_skill(skill)
+            if cleaned and len(cleaned) >= 2:
+                cleaned_skills.append(cleaned)
+        
+        # 6. Remove duplicates and similar skills
+        final_skills = self._deduplicate_skills(cleaned_skills)
+        
+        # Sort by length (shorter skills first, they're usually more specific)
+        final_skills.sort(key=len)
+        
+        logger.info(f"🔧 Extracted {len(final_skills)} skills from job description")
+        return final_skills[:15]  # Limit to top 15 skills
+    
+    def _is_valid_skill(self, skill_text: str) -> bool:
+        """Check if extracted text is a valid skill"""
+        if not skill_text or len(skill_text.strip()) < 2:
+            return False
+        
+        skill = skill_text.strip().lower()
+        
+        # Too long (probably a sentence, not a skill)
+        if len(skill) > 100:
+            return False
+        
+        # Contains common non-skill indicators
+        invalid_indicators = [
+            'years', 'degree', 'bachelor', 'master', 'phd', 'certification', 
+            'salary', 'location', 'remote', 'full time', 'part time',
+            'we are', 'you will', 'the ideal', 'candidate', 'applicant',
+            'company', 'team', 'role', 'position', 'job', 'work',
+            'email', 'phone', 'contact', 'apply', 'send', 'resume',
+            'privacy policy', 'terms of service', 'cookie policy',
+            'rights reserved', 'all rights', 'copyright', 'inc.',
+            'made with', 'powered by', 'about us', 'contact us',
+            'sign up', 'log in', 'login', 'register', 'home', 'back',
+            'next', 'previous', 'more info', 'learn more', 'read more'
+        ]
+        
+        if any(indicator in skill for indicator in invalid_indicators):
+            return False
+        
+        # Skip single letters or numbers
+        if len(skill.strip()) <= 1:
+            return False
+        
+        # Skip common UI/navigation terms
+        ui_terms = [
+            'home', 'about', 'contact', 'login', 'signup', 'dashboard',
+            'profile', 'settings', 'help', 'support', 'faq', 'blog',
+            'careers', 'news', 'events', 'services', 'products',
+            'solutions', 'pricing', 'plans', 'features', 'benefits'
+        ]
+        
+        if skill in ui_terms:
+            return False
+        
+        # Too many common words (probably not a skill)
+        common_words = ['the', 'and', 'or', 'in', 'on', 'at', 'to', 'for', 'with', 'of', 'is', 'are', 'be', 'have', 'has']
+        words = skill.split()
+        common_word_count = sum(1 for word in words if word in common_words)
+        if len(words) > 3 and common_word_count > len(words) * 0.5:
+            return False
+        
+        return True
+    
+    def _clean_skill(self, skill: str) -> str:
+        """Clean and normalize skill text"""
+        # Remove extra whitespace and common prefixes/suffixes
+        skill = re.sub(r'\s+', ' ', skill.strip())
+        
+        # Remove common prefixes
+        prefixes = ['strong ', 'good ', 'excellent ', 'solid ', 'proven ', 'extensive ']
+        for prefix in prefixes:
+            if skill.lower().startswith(prefix):
+                skill = skill[len(prefix):]
+        
+        # Remove common suffixes
+        suffixes = [' experience', ' skills', ' knowledge', ' proficiency']
+        for suffix in suffixes:
+            if skill.lower().endswith(suffix):
+                skill = skill[:-len(suffix)]
+        
+        # Capitalize properly
+        skill = skill.strip()
+        if skill:
+            # Handle special cases for tech terms
+            tech_capitalizations = {
+                'javascript': 'JavaScript',
+                'typescript': 'TypeScript',
+                'nodejs': 'Node.js',
+                'reactjs': 'React.js',
+                'vuejs': 'Vue.js',
+                'angularjs': 'Angular.js',
+                'css3': 'CSS3',
+                'html5': 'HTML5',
+                'mysql': 'MySQL',
+                'postgresql': 'PostgreSQL',
+                'mongodb': 'MongoDB',
+                'graphql': 'GraphQL',
+                'restful': 'RESTful',
+                'api': 'API',
+                'aws': 'AWS',
+                'gcp': 'GCP',
+                'ai': 'AI',
+                'ml': 'ML',
+                'ci/cd': 'CI/CD'
+            }
+            
+            skill_lower = skill.lower()
+            if skill_lower in tech_capitalizations:
+                return tech_capitalizations[skill_lower]
+            elif skill.isupper() and len(skill) <= 5:  # Keep acronyms uppercase
+                return skill
+            else:
+                return skill.title()
+        
+        return skill
+    
+    def _deduplicate_skills(self, skills: List[str]) -> List[str]:
+        """Remove duplicate and very similar skills"""
+        if not skills:
+            return []
+        
+        # Convert to lowercase for comparison
+        seen = set()
+        deduplicated = []
+        
+        for skill in skills:
+            skill_lower = skill.lower()
+            
+            # Check for exact duplicates
+            if skill_lower in seen:
+                continue
+            
+            # Check for very similar skills (>= 80% similarity)
+            is_similar = False
+            for existing_skill in deduplicated:
+                similarity = self._calculate_similarity(skill_lower, existing_skill.lower())
+                if similarity >= 0.8:
+                    is_similar = True
+                    # Keep the shorter one (usually more specific)
+                    if len(skill) < len(existing_skill):
+                        deduplicated.remove(existing_skill)
+                        deduplicated.append(skill)
                     break
             
-            # Extract company name - usually near the title
-            company_selectors = [
-                'div.flex.items-center.gap-3 img[alt]',  # Company logo with alt text
-                'div.flex.items-center.justify-between h2',  # Company heading
-                'div[class*="company-info"] span',
-                '[class*="company"]', 
-                'h2', 
-                'h3'
-            ]
-            for selector in company_selectors:
-                company_elem = soup.select_one(selector)
-                if company_elem:
-                    if company_elem.name == 'img' and company_elem.has_attr('alt'):
-                        text = company_elem['alt'].strip()
-                    else:
-                        text = company_elem.get_text().strip()
-                    
-                    if text and len(text) < 50:
-                        details['company_name'] = text
-                        break
+            if not is_similar:
+                deduplicated.append(skill)
+                seen.add(skill_lower)
+        
+        return deduplicated
+        
+    def _filter_concatenated_duplicates(self, skills: List[str]) -> List[str]:
+        """Remove concatenated skills when we have the individual components"""
+        if not skills:
+            return []
+        
+        # Create a list to track which skills to keep
+        filtered_skills = []
+        
+        for skill in skills:
+            skill_lower = skill.lower()
             
-            # Extract full job description from specific section
-            # Based on the example: <div class="bg-gradient-to-br from-zinc-900/90 to-zinc-950/90 rounded-xl p-8 mb-8 border border-zinc-800/50">
-            # with heading "Job Description"
-            description = ""
+            # Check if this skill looks like a concatenated version
+            is_concatenated = False
             
-            # Exact match for the div structure provided in the example
-            job_desc_section = soup.find('h2', string=lambda text: text and 'job description' in text.lower())
-            if job_desc_section:
-                # Get the parent div containing the description - match the exact class from example
-                parent_div = job_desc_section.find_parent('div', class_=lambda c: c and 'bg-gradient-to-br' in c and 'from-zinc-900' in c)
-                if parent_div:
-                    # Find the prose div that contains the actual description
-                    prose_div = parent_div.find('div', class_='prose')
-                    if prose_div:
-                        description = prose_div.get_text(separator='\n').strip()
-                        logger.info("Found description using exact devsunite.com structure")
-            
-            if not description:
-                # Fallback selectors if the exact structure wasn't found
-                desc_selectors = [
-                    'div.prose.prose-invert',
-                    'div.prose',
-                    'div[class*="bg-gradient-to-br"] div.prose',
-                    'div[class*="description"]',
-                    'div[class*="job-details"]',
-                    '[class*="content"]', 
-                    'article'
-                ]
-                for selector in desc_selectors:
-                    desc_elem = soup.select_one(selector)
-                    if desc_elem:
-                        description = desc_elem.get_text(separator='\n').strip()
-                        logger.info(f"Found description using fallback selector: {selector}")
-                        break
-            
-            if description:
-                details['full_description'] = description
-                # Create a concise summary for short description (first 200 chars)
-                short_desc = ' '.join(description.split()[:30])
-                if len(short_desc) > 200:
-                    short_desc = short_desc[:200] + '...'
-                else:
-                    short_desc = short_desc + '...'
-                details['short_description'] = short_desc
-                logger.info(f"Extracted description: {len(description)} chars")
-            
-            # Extract skills from the specific "Required Skills" section
-            # Based on the example: <div class="bg-gradient-to-br from-zinc-900/90 to-zinc-950/90 rounded-xl p-8 mb-8 border border-zinc-800/50">
-            # with heading "Required Skills"
-            skills = []
-            
-            # Exact match for the structure provided in the example
-            skills_section = soup.find('h2', string=lambda text: text and ('required skills' in text.lower() or 
-                                                                            'skills' in text.lower() or 
-                                                                            'tech stack' in text.lower()))
-            if skills_section:
-                # Get the parent div containing the skills - match the exact class from example
-                parent_div = skills_section.find_parent('div', class_=lambda c: c and 'bg-gradient-to-br' in c and 'from-zinc-900' in c)
-                if parent_div:
-                    # Try multiple skill selectors based on the example
-                    skill_selectors = [
-                        'div.flex.flex-wrap span[class*="bg-[#2CEE91]"]',  # Green background
-                        'div.flex.flex-wrap span[class*="text-[#2CEE91]"]',  # Green text
-                        'div.flex.flex-wrap span[class*="border-[#2CEE91]"]',  # Green border
-                        'div.flex.flex-wrap span',  # Any span in a flex wrap container
-                    ]
-                    
-                    for selector in skill_selectors:
-                        skill_spans = parent_div.select(selector)
-                        if skill_spans:
-                            logger.info(f"Found {len(skill_spans)} skills using selector: {selector}")
-                            for span in skill_spans:
-                                skill_text = span.get_text().strip()
-                                if skill_text and skill_text not in skills and len(skill_text) < 30:
-                                    skills.append(skill_text)
-                            
-                            # If we found skills, no need to try other selectors
-                            if skills:
+            # If the skill is long and contains multiple known technologies
+            if len(skill) > 6:  # Reduced threshold to catch more cases
+                # Count how many other skills from our list are contained in this skill
+                contained_skills = []
+                for other_skill in skills:
+                    if other_skill != skill and len(other_skill) >= 3:
+                        if other_skill.lower() in skill_lower:
+                            contained_skills.append(other_skill)
+                
+                # If this skill contains 2 or more other skills, it's likely concatenated
+                if len(contained_skills) >= 2:
+                    is_concatenated = True
+                    logger.info(f"🔄 Filtering out concatenated skill '{skill}' (contains: {contained_skills})")
+                
+                # Special case: if this skill contains another skill + some extra characters, it might be concatenated
+                elif len(contained_skills) == 1 and len(skill) > len(contained_skills[0]) + 2:
+                    # Check if the remaining part might be another skill
+                    remaining_part = skill_lower.replace(contained_skills[0].lower(), '')
+                    if len(remaining_part) >= 3:
+                        # Check if remaining part matches any other skill
+                        for other_skill in skills:
+                            if other_skill != skill and other_skill.lower() == remaining_part:
+                                is_concatenated = True
+                                logger.info(f"🔄 Filtering out concatenated skill '{skill}' (contains: {contained_skills[0]} + {other_skill})")
                                 break
             
-            if not skills:
-                # Fallback selectors if the specific structure wasn't found
-                skill_selectors = [
-                    # More specific based on the example structure
-                    'div.flex.flex-wrap span[class*="text-[#2CEE91]"]',
-                    'div.flex.flex-wrap span[class*="border-[#2CEE91]"]',
-                    'div.flex.flex-wrap span',
-                    # General fallbacks
-                    'span[class*="bg-[#2CEE91]"]',
-                    '[class*="skill"]', 
-                    '[class*="tag"]', 
-                    '[class*="badge"]',
-                    'span[class*="rounded-lg"]', 
-                    'ul li', 
-                    '.tech-stack'
-                ]
-                for selector in skill_selectors:
-                    skill_elems = soup.select(selector)
-                    if skill_elems:
-                        logger.info(f"Found {len(skill_elems)} skills using fallback selector: {selector}")
-                        for elem in skill_elems:
-                            skill_text = elem.get_text().strip()
-                            if skill_text and len(skill_text) < 30 and skill_text not in skills:
-                                skills.append(skill_text)
-                        # If we found skills with this selector, stop trying others
-                        if skills:
-                            break
+            if not is_concatenated:
+                filtered_skills.append(skill)
+        
+        return filtered_skills
+    
+    def _calculate_similarity(self, str1: str, str2: str) -> float:
+        """Calculate similarity between two strings using simple algorithm"""
+        if str1 == str2:
+            return 1.0
+        
+        # Simple character-based similarity
+        longer = str1 if len(str1) > len(str2) else str2
+        shorter = str2 if len(str1) > len(str2) else str1
+        
+        if len(longer) == 0:
+            return 1.0
+        
+        # Count matching characters
+        matches = 0
+        for char in shorter:
+            if char in longer:
+                matches += 1
+        
+        return matches / len(longer)
+        """Calculate similarity between two strings using simple algorithm"""
+        if str1 == str2:
+            return 1.0
+        
+        # Simple character-based similarity
+        longer = str1 if len(str1) > len(str2) else str2
+        shorter = str2 if len(str1) > len(str2) else str1
+        
+        if len(longer) == 0:
+            return 1.0
+        
+        # Count matching characters
+        matches = 0
+        for char in shorter:
+            if char in longer:
+                matches += 1
+        
+        return matches / len(longer)
+    
+    def parse_compensation(self, compensation_text: str) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+        """Parse compensation string to extract min and max salary"""
+        if not compensation_text:
+            return None, None
+        
+        # Remove common prefixes/suffixes
+        comp = compensation_text.lower().replace('lpa', '').replace('₹', '').replace(',', '').strip()
+        
+        # Look for range patterns: "15-25", "15 to 25", "15 - 25"
+        range_patterns = [
+            r'(\d+(?:\.\d+)?)\s*[-to]+\s*(\d+(?:\.\d+)?)',
+            r'(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)',
+            r'between\s+(\d+(?:\.\d+)?)\s+and\s+(\d+(?:\.\d+)?)'
+        ]
+        
+        for pattern in range_patterns:
+            match = re.search(pattern, comp)
+            if match:
+                try:
+                    min_sal = Decimal(match.group(1)) * 100000  # Convert LPA to annual
+                    max_sal = Decimal(match.group(2)) * 100000
+                    return min_sal, max_sal
+                except:
+                    continue
+        
+        # Look for single value: "25 LPA", "₹25L"
+        single_patterns = [
+            r'(\d+(?:\.\d+)?)\s*l?pa?',
+            r'₹\s*(\d+(?:\.\d+)?)',
+            r'(\d+(?:\.\d+)?)\s*lakhs?'
+        ]
+        
+        for pattern in single_patterns:
+            match = re.search(pattern, comp)
+            if match:
+                try:
+                    salary = Decimal(match.group(1)) * 100000
+                    return salary, salary
+                except:
+                    continue
+        
+        return None, None
+    
+    def save_job_to_database(self, job_info: Dict, job_details: Dict) -> Tuple[Optional[Job], bool]:
+        """Save job to Django database"""
+        try:
+            # Combine basic info with detailed info
+            full_description = job_details.get('full_description', job_info.get('short_description', ''))
+            skills = job_details.get('skills_required', [])
             
-            if skills:
-                details['skills_required'] = skills[:15]  # Allow up to 15 skills
-                logger.info(f"Found {len(details['skills_required'])} skills: {', '.join(details['skills_required'])}")
+            # Parse compensation for min/max salary
+            min_salary, max_salary = self.parse_compensation(job_info.get('compensation', ''))
             
-            # Extract location information more accurately
-            location_section = soup.find('div', string=lambda text: text and 'location' in text.lower())
-            if location_section:
-                next_elem = location_section.find_next('div')
-                if next_elem:
-                    details['location'] = next_elem.get_text().strip()
-            else:
-                # Try to extract location and job type from text
-                page_text = soup.get_text().lower()
-                if 'remote' in page_text:
-                    details['location'] = 'Remote'
-                elif 'onsite' in page_text or 'on-site' in page_text:
-                    details['location'] = 'Onsite'
-                elif 'hybrid' in page_text:
-                    details['location'] = 'Hybrid'
+            # Create or update job
+            job_obj, created = Job.objects.update_or_create(
+                external_id=f"devsunite_{job_info['company'].replace(' ', '_')}_{job_info['title'].replace(' ', '_')}",
+                defaults={
+                    'role': job_info['title'],
+                    'company_name': job_info['company'],
+                    'location': job_info['location'],
+                    'job_type': job_info['job_type'],
+                    'min_salary': min_salary,
+                    'max_salary': max_salary,
+                    'salary_currency': 'INR',  # DevSunite shows LPA (Indian Rupees)
+                    'experience_required': job_info['experience'],
+                    'short_description': job_info.get('short_description', full_description[:300] if full_description else ''),
+                    'full_description': full_description or job_info.get('short_description', ''),
+                    'skills_required': skills,
+                    'compensation': job_info.get('compensation', ''),
+                    'apply_link': job_info.get('apply_url') or job_info.get('view_details_url', ''),
+                    'view_details_link': job_info.get('view_details_url', ''),
+                    'details_scraped': bool(job_details)
+                }
+            )
             
-            # Extract job type more accurately
-            job_type_section = soup.find('div', string=lambda text: text and 'job type' in text.lower())
-            if job_type_section:
-                next_elem = job_type_section.find_next('div')
-                if next_elem:
-                    job_type_text = next_elem.get_text().strip().lower()
-                    if 'full time' in job_type_text or 'full-time' in job_type_text:
-                        details['job_type'] = 'FULL_TIME'
-                    elif 'part time' in job_type_text or 'part-time' in job_type_text:
-                        details['job_type'] = 'PART_TIME'
-                    elif 'contract' in job_type_text:
-                        details['job_type'] = 'CONTRACT'
-                    elif 'internship' in job_type_text:
-                        details['job_type'] = 'INTERNSHIP'
-            else:
-                # Fallback to page text
-                page_text = soup.get_text().lower()
-                if 'internship' in page_text:
-                    details['job_type'] = 'INTERNSHIP'
-                elif 'part-time' in page_text or 'part time' in page_text:
-                    details['job_type'] = 'PART_TIME'
-                elif 'contract' in page_text:
-                    details['job_type'] = 'CONTRACT'
-                elif 'full-time' in page_text or 'full time' in page_text:
-                    details['job_type'] = 'FULL_TIME'
-            
-            # Try to extract compensation if available
-            compensation_section = soup.find('div', string=lambda text: text and 'compensation' in text.lower())
-            if compensation_section:
-                next_elem = compensation_section.find_next('div')
-                if next_elem:
-                    details['compensation'] = next_elem.get_text().strip()
-            
-            logger.info(f"Successfully scraped detailed job information from: {job_url}")
-            return details
+            action = "Created" if created else "Updated"
+            logger.info(f"💾 {action} job: {job_info['title']} at {job_info['company']}")
+            return job_obj, created
             
         except Exception as e:
-            logger.error(f"Error getting full description from {job_url}: {e}")
-            return {}
+            logger.error(f"❌ Error saving job to database: {e}")
+            return None, False
+    
+    def scrape_jobs(self, max_jobs: int = 100, max_pages: int = 10, scrape_details: bool = True) -> Dict:
+        """Main scraping method with enhanced multi-page support"""
+        results = {
+            'success': False,
+            'jobs_scraped': 0,
+            'jobs_saved': 0,
+            'pages_scraped': 0,
+            'errors': [],
+            'message': ''
+        }
+        
+        try:
+            # Initialize WebDriver
+            if not self.setup_driver():
+                results['errors'].append("Failed to initialize WebDriver")
+                return results
+            
+            logger.info(f"🚀 Starting DevSunite scraping process (max_jobs={max_jobs}, max_pages={max_pages}, details={scrape_details})")
+            
+            # Extract jobs from multiple pages
+            jobs = self.extract_job_cards(max_pages=max_pages)
+            
+            if not jobs:
+                results['errors'].append("No jobs found on any pages")
+                return results
+            
+            # Limit jobs to scrape if specified
+            jobs_to_process = jobs[:max_jobs] if max_jobs > 0 else jobs
+            logger.info(f"🎯 Successfully extracted {len(jobs_to_process)} jobs from {len(jobs)} total found")
+            
+            jobs_saved = 0
+            
+            # Process each job
+            for i, job_info in enumerate(jobs_to_process, 1):
+                try:
+                    logger.info(f"📝 Processing job {i}/{len(jobs_to_process)}: {job_info['title']}")
+                    
+                    job_details = {}
+                    if scrape_details and job_info.get('view_details_url'):
+                        job_details = self.scrape_job_details(job_info['view_details_url'])
+                    
+                    # Save to database
+                    job_obj, created = self.save_job_to_database(job_info, job_details)
+                    if job_obj:
+                        jobs_saved += 1
+                    
+                except Exception as e:
+                    error_msg = f"Error processing job {i}: {e}"
+                    logger.error(f"❌ {error_msg}")
+                    results['errors'].append(error_msg)
+                    continue
+            
+            results.update({
+                'success': True,
+                'jobs_scraped': len(jobs_to_process),
+                'jobs_saved': jobs_saved,
+                'pages_scraped': min(max_pages, len(jobs)//12 + 1),  # Estimate pages scraped
+                'message': f'Successfully scraped and saved {jobs_saved}/{len(jobs_to_process)} jobs from DevSunite across multiple pages!'
+            })
+            
+            logger.info(f"🎉 Scraping completed! Saved {jobs_saved}/{len(jobs_to_process)} jobs")
+            
+        except Exception as e:
+            error_msg = f"Critical error during scraping: {e}"
+            logger.error(f"❌ {error_msg}")
+            results['errors'].append(error_msg)
+            
+        finally:
+            self.close_driver()
+            
+        return results
+
+
+class JobViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet for Job model with integrated scraping functionality
+    """
+    queryset = Job.objects.all().order_by('-created_at')
+    serializer_class = JobSerializer
+    
+    @action(detail=False, methods=['post'])
+    def scrape_devsunite(self, request):
+        """
+        API endpoint to trigger DevSunite scraping with multi-page support
+        
+        POST /api/jobs/scrape_devsunite/
+        {
+            "max_jobs": 100,       // 0 = no limit, default 100
+            "max_pages": 10,       // Maximum pages to scrape, default 10
+            "scrape_details": true // Scrape full job details, default true
+        }
+        """
+        try:
+            # Get parameters from request
+            max_jobs = request.data.get('max_jobs', 100)
+            max_pages = request.data.get('max_pages', 10)
+            scrape_details = request.data.get('scrape_details', True)
+            
+            # Validate parameters
+            if not isinstance(max_jobs, int) or max_jobs < 0 or max_jobs > 1000:
+                return Response(
+                    {'error': 'max_jobs must be an integer between 0 and 1000 (0 = no limit)'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            if not isinstance(max_pages, int) or max_pages < 1 or max_pages > 50:
+                return Response(
+                    {'error': 'max_pages must be an integer between 1 and 50'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Initialize scraper and run
+            scraper = DevSuniteScraperService()
+            results = scraper.scrape_jobs(max_jobs=max_jobs, max_pages=max_pages, scrape_details=scrape_details)
+            
+            # Return results
+            if results['success']:
+                return Response(results, status=status.HTTP_200_OK)
+            else:
+                return Response(results, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+                
+        except Exception as e:
+            logger.error(f"❌ Error in scrape_devsunite endpoint: {e}")
+            return Response(
+                {'error': f'Scraping failed: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @action(detail=False, methods=['post'])
+    def refresh(self, request):
+        """
+        API endpoint to refresh jobs by triggering a scraping operation
+        
+        POST /api/jobs/refresh/
+        """
+        try:
+            # Use default parameters for refresh - moderate scraping
+            max_jobs = 50  # Reasonable default for refresh
+            max_pages = 5  # 5 pages should be enough for a refresh
+            scrape_details = True  # Always scrape details for complete job info
+            
+            logger.info(f"🔄 Jobs refresh triggered via API endpoint")
+            
+            # Initialize scraper and run
+            scraper = DevSuniteScraperService()
+            results = scraper.scrape_jobs(max_jobs=max_jobs, max_pages=max_pages, scrape_details=scrape_details)
+            
+            # Return results
+            if results['success']:
+                return Response({
+                    'success': True,
+                    'message': 'Jobs refreshed successfully',
+                    'jobs_scraped': results.get('jobs_scraped', 0),
+                    'jobs_saved': results.get('jobs_saved', 0),
+                    'pages_scraped': results.get('pages_scraped', 0),
+                    'errors': results.get('errors', [])
+                }, status=status.HTTP_200_OK)
+            else:
+                return Response({
+                    'success': False,
+                    'message': 'Jobs refresh completed with some issues',
+                    'jobs_scraped': results.get('jobs_scraped', 0),
+                    'jobs_saved': results.get('jobs_saved', 0),
+                    'pages_scraped': results.get('pages_scraped', 0),
+                    'errors': results.get('errors', [])
+                }, status=status.HTTP_200_OK)  # Still 200 since operation completed
+                
+        except Exception as e:
+            logger.error(f"❌ Error in refresh endpoint: {e}")
+            return Response(
+                {'success': False, 'error': f'Refresh failed: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @action(detail=False, methods=['get'])
+    def scraping_stats(self, request):
+        """
+        Get scraping statistics
+        
+        GET /api/jobs/scraping_stats/
+        """
+        try:
+            total_jobs = Job.objects.count()
+            scraped_with_details = Job.objects.filter(details_scraped=True).count()
+            recent_jobs = Job.objects.filter(created_at__gte=timezone.now() - timedelta(days=7)).count()
+            
+            stats = {
+                'total_jobs': total_jobs,
+                'jobs_with_details': scraped_with_details,
+                'recent_jobs_7_days': recent_jobs,
+                'completion_rate': f"{(scraped_with_details/total_jobs*100):.1f}%" if total_jobs > 0 else "0%"
+            }
+            
+            return Response(stats, status=status.HTTP_200_OK)
+            
+        except Exception as e:
+            return Response(
+                {'error': f'Failed to get stats: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @action(detail=False, methods=['delete'])
+    def clear_jobs(self, request):
+        """
+        Clear all jobs from database
+        
+        DELETE /api/jobs/clear_jobs/
+        """
+        try:
+            count = Job.objects.count()
+            Job.objects.all().delete()
+            
+            return Response(
+                {'message': f'Cleared {count} jobs from database'},
+                status=status.HTTP_200_OK
+            )
+            
+        except Exception as e:
+            return Response(
+                {'error': f'Failed to clear jobs: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
